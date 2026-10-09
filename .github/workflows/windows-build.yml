@@ -1,0 +1,36 @@
+name: Build Windows Plugin
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install OpenCL
+      run: vcpkg install opencl
+
+    - name: Build C++ Engine
+      working-directory: hpc-engine
+      run: |
+        mkdir build
+        cd build
+        cmake .. -DUSE_OPENCL=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -G "Visual Studio 17 2022" -A x64
+        cmake --build . --config Release
+
+    - name: Package QGIS Plugin
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path qgis-plugin/hyperspatial_bigdata/bin
+        Copy-Item hpc-engine/build/Release/hyperspatial_cli.exe -Destination qgis-plugin/hyperspatial_bigdata/bin/
+        Compress-Archive -Path qgis-plugin/hyperspatial_bigdata -DestinationPath hyperspatial_bigdata_windows.zip
+
+    - name: Upload Zip File
+      uses: actions/upload-artifact@v3
+      with:
+        name: hyperspatial_bigdata_windows_plugin
+        path: hyperspatial_bigdata_windows.zip
