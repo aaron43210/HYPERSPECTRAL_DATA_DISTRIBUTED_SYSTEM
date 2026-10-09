@@ -45,10 +45,15 @@ jobs:
           cmake --build hpc-engine/build -j
       - name: Bundle engine + dylibs (self-contained via @loader_path)
         run: |
+          set -x
           BIN=qgis-plugin/hyperspatial_processing/hyperspatial_processing/bin/macos
           mkdir -p "$BIN"
           cp hpc-engine/build/hyperspatial_cli "$BIN/"
-          dylibbundler -of -b -x "$BIN/hyperspatial_cli" -d "$BIN/libs" -p @loader_path/libs
+          otool -L "$BIN/hyperspatial_cli" || true
+          # -s gives dylibbundler the Homebrew lib dir so it resolves @rpath deps
+          # without prompting; </dev/null avoids any interactive hang in CI.
+          dylibbundler -of -b -x "$BIN/hyperspatial_cli" -d "$BIN/libs" -p @loader_path/libs \
+            -s /opt/homebrew/lib -s "$(brew --prefix)/lib" </dev/null
       - name: Package zip
         run: zip -r hyperspatial_processing_macos.zip qgis-plugin/hyperspatial_processing/hyperspatial_processing
       - uses: actions/upload-artifact@v4
