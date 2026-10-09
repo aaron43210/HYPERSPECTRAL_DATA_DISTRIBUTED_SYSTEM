@@ -11,8 +11,8 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install OpenCL
-      run: vcpkg install opencl
+    - name: Install Dependencies
+      run: vcpkg install opencl gdal
 
     - name: Build C++ Engine
       working-directory: hpc-engine
