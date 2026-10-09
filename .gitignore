@@ -1,0 +1,32 @@
+# ---- Large sample data (do NOT commit; 600+ MB EnMAP scenes) ----
+data/
+*.bsq
+*.BSQ
+
+# ---- C++ build artifacts ----
+hpc-engine/build/
+hpc-engine/build_*/
+*.o
+*.a
+*.obj
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- Spark / benchmark outputs ----
+sedona_results/
+benchmarks/results/
+spark-warehouse/
+metastore_db/
+
+# ---- OS / editor ----
+.DS_Store
+*.swp
+.idea/
+
+# ---- Keep the bundled plugin binary (plugin requires it) ----
+!qgis-plugin/hyperspatial_bigdata/bin/hyperspatial_cli
