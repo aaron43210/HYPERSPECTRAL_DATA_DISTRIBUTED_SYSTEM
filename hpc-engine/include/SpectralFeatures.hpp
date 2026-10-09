@@ -44,7 +44,7 @@ public:
 
         const float L = 0.5f; // SAVI soil-brightness correction factor
 
-#ifdef _OPENMP
+#if defined(_OPENMP) && !defined(_MSC_VER)
         #pragma omp simd
 #endif
         for (size_t i = 0; i < numPixels; ++i) {

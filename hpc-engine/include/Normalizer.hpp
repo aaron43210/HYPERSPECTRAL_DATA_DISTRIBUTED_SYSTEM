@@ -35,7 +35,7 @@ public:
 
             const size_t sz = band.values.size();
 
-#ifdef _OPENMP
+#if defined(_OPENMP) && !defined(_MSC_VER)
             #pragma omp simd reduction(min:minVal) reduction(max:maxVal)
 #endif
             for (size_t i = 0; i < sz; ++i) {
@@ -49,7 +49,7 @@ public:
             // Normalise if there is a valid range
             if (minVal < maxVal && minVal != 1e30f) {
                 const float range = maxVal - minVal;
-#ifdef _OPENMP
+#if defined(_OPENMP) && !defined(_MSC_VER)
                 #pragma omp simd
 #endif
                 for (size_t i = 0; i < sz; ++i) {

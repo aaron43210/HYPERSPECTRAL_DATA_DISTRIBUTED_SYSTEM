@@ -191,10 +191,13 @@ int main(int argc, char** argv) {
     std::string firstError;
     std::mutex errMutex;
 
+    // MSVC's OpenMP (2.0) requires a signed loop index (error C3016 otherwise);
+    // precompute a signed bound so the parallel-for is valid on MSVC too.
+    const long long tileCount = static_cast<long long>(tiles.size());
 #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic) shared(tiles, args, reader) if(runParallel)
 #endif
-    for (size_t i = 0; i < tiles.size(); ++i) {
+    for (long long i = 0; i < tileCount; ++i) {
       try {
         HyperspectralTile tile = reader.readTile(tiles[i]);
 
