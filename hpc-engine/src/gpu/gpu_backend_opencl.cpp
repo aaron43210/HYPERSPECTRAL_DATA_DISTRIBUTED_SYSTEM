@@ -141,7 +141,9 @@ bool init_opencl() {
 
     char name[256] = {0};
     clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(name), name, nullptr);
-    std::cout << "[opencl] Initializing Device: " << name << "\n";
+    cl_uint compute_units = 0;
+    clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(compute_units), &compute_units, nullptr);
+    std::cout << "[opencl] Initializing Device: " << name << " (" << compute_units << " Compute Units)\n";
 
     clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(g_local_size), &g_local_size, nullptr);
     g_local_size = std::min<size_t>(256, g_local_size);
