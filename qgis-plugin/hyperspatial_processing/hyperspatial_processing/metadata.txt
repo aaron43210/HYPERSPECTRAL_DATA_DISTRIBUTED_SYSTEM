@@ -1,0 +1,18 @@
+# This file contains metadata for your plugin
+[general]
+name=Hyperspectral Index Processing
+qgisMinimumVersion=3.0
+qgisMaximumVersion=4.99
+description=Local hyperspectral processing: generates spectral-index GeoTIFFs (NDVI, NDWI, NDBI, SAVI, EVI, NDMI, MSAVI) from hyperspectral rasters via a C++/OpenMP/OpenCL engine.
+version=0.1
+author=Aaron R
+email=aaronr43210@gmail.com
+about=Single-purpose, local-first QGIS plugin from Digital University Kerala for hyperspectral image processing. It drives an external C++/OpenMP/OpenCL engine to compute spectral indices (NDVI, NDWI, NDBI, SAVI, EVI, NDMI, MSAVI) from hyperspectral rasters, writes them as GeoTIFF or VRT layers, and loads the results straight into the QGIS canvas. All per-pixel math runs in the native engine to keep large scenes off the Python heap. The plugin ships binary-free: the engine is located at run time from a configured path, the system PATH, or built from the bundled hpc-engine source.
+category=Raster
+experimental=True
+# TODO: replace placeholder repo URL before publishing
+tracker=https://github.com/aaronr-dukerala/hyperspatial_processing/issues
+# TODO: replace placeholder repo URL before publishing
+repository=https://github.com/aaronr-dukerala/hyperspatial_processing
+# TODO: replace placeholder repo URL before publishing
+homepage=https://github.com/aaronr-dukerala/hyperspatial_processing

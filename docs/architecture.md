@@ -41,7 +41,7 @@ documented separately and defended in code.
 |------|------|
 | `hpc-engine/` | C++17 preprocessor (headers in `include/`, sources in `src/`, OpenCL in `src/gpu/`) |
 | `qgis-plugin/hyperspatial_bigdata/` | The unified QGIS plugin (UI orchestrator) |
-| `qgis-plugin/hyperspatial_bigdata/bin/` | The **prebuilt** `hyperspatial_cli` the plugin runs |
+| `qgis-plugin/hyperspatial_bigdata/bin/` | The **prebuilt** `hyperspatial_cli` the plugin runs (per-OS: `windows/`, `linux/`, `macos/`, or flat) |
 | `qgis-plugin/hyperspatial_bigdata/spark-sedona/` | Bundled copy of the Spark jobs the plugin runs |
 | `spark-sedona/` | Source of truth for the Spark/Sedona jobs |
 | `docs/` | `architecture.md` (this file), `connections.md` |
@@ -222,7 +222,13 @@ runs on CPU. The `RESULT mode=` line reports what actually ran (`gpu` only when 
 GPU initialised).
 
 The headers pin `CL_TARGET_OPENCL_VERSION=120` (OpenCL 1.2 — the common
-denominator across all four vendors, keeping `clCreateCommandQueue` non-deprecated).
+denominator across all four vendors) in both `gpu_backend_opencl.cpp` and the
+CMake target definitions. This keeps `clCreateCommandQueue` non-deprecated and,
+on Linux/Windows, stops the Khronos headers from hiding the 1.x entry points the
+backend uses (Apple's `<OpenCL/cl.h>` ignores the macro). On macOS the OpenCL
+framework is built in; on Linux install an ICD loader + vendor runtime
+(`ocl-icd-opencl-dev` + e.g. NVIDIA/Intel/`mesa-opencl-icd`); on Windows the GPU
+driver supplies `OpenCL.dll` and `find_package(OpenCL)` links the SDK import lib.
 
 > **MPI note.** On a single node, oversubscription is possible if each rank also
 > spawns many OpenMP threads. The MPI binary defaults to **1 thread/rank**; raise
@@ -352,12 +358,17 @@ cmake --build hpc-engine/build -j
 Dependencies: GDAL (required), OpenMP (optional; auto-detected via Homebrew
 `libomp` on macOS), OpenCL (optional, `-DUSE_OPENCL=ON` default), MPI (optional).
 
-* **Portability:** the build defaults to a portable `-O3`. `-march=native` is
-  **off** by default and opt-in via `-DNATIVE_ARCH=ON` — a `-march=native` binary
-  aborts with SIGILL on a different/older CPU, and the plugin ships a *prebuilt*
-  binary.
-* Copy the resulting `hyperspatial_cli` into
-  `qgis-plugin/hyperspatial_bigdata/bin/` (rebuild per target architecture).
+* **Portability:** the build defaults to a portable optimised build (`-O3` on
+  GCC/Clang, `/O2` on MSVC). `-march=native` is **off** by default and opt-in via
+  `-DNATIVE_ARCH=ON` (GCC/Clang only) — a `-march=native` binary aborts with
+  SIGILL on a different/older CPU, and the plugin ships a *prebuilt* binary.
+* Copy the resulting `hyperspatial_cli` into the plugin's `bin/`. The engine is a
+  native per-OS executable, so a cross-platform plugin uses one sub-folder per OS
+  — `bin/windows/hyperspatial_cli.exe`, `bin/linux/hyperspatial_cli`,
+  `bin/macos/hyperspatial_cli` (macOS and Linux share the file name and cannot
+  co-exist flat). `dialog.py::_resolve_cli` picks the host's variant; a flat
+  `bin/hyperspatial_cli[.exe]` is still accepted for a single-OS package. Rebuild
+  per target OS/architecture.
 
 ### 5.2 Python / Spark environment
 `environment.yml` pins Python 3.11, GDAL 3.10, PySpark 3.4, Shapely ≥2, and

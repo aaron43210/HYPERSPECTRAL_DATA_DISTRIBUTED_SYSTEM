@@ -1,0 +1,16 @@
+# This file contains metadata for your plugin
+[general]
+name=HyperSpatial EnMAP Downloader
+qgisMinimumVersion=3.0
+qgisMaximumVersion=4.99
+description=Search and download EnMAP L2A hyperspectral scenes from the DLR STAC catalogue.
+version=0.1
+author=Aaron R
+email=aaronr43210@gmail.com
+about=HyperSpatial EnMAP Downloader is a lightweight, local-first QGIS plugin for searching and downloading EnMAP Level-2A hyperspectral scenes from the DLR EnMAP STAC catalogue. Developed at Digital University Kerala, it lets you define a bounding box and date range, browse the matching scenes with their acquisition date and cloud-cover metadata, and stream a selected scene to disk in the background without blocking the QGIS interface. An optional DLR EOWEB bearer token can be supplied for restricted assets.
+category=Web
+# TODO: replace placeholder repo URL before publishing
+tracker=https://github.com/aaronr-dukerala/hyperspatial_downloader/issues
+repository=https://github.com/aaronr-dukerala/hyperspatial_downloader
+homepage=https://github.com/aaronr-dukerala/hyperspatial_downloader
+experimental=True

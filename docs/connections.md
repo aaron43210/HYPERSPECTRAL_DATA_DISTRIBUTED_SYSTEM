@@ -10,9 +10,13 @@ Treat each boundary below as an API.
 
 * **Invocation:** `subprocess.Popen([cli, "--input", <path>, "--output", <dir>, "--threads", <n>, "--mode", <openmp|gpu>])`,
   `stderr=STDOUT`, line-buffered. Runs in a worker thread; stdout is streamed to
-  the log via `hpc_log` signal. The HPC tab's **Backend** dropdown sets `--mode`
-  (`openmp` CPU or `gpu` cross-vendor OpenCL); `gpu` self-falls-back to CPU if no
-  OpenCL GPU is present, so it is always safe to pass.
+  the log via `hpc_log` signal. `cli` is resolved per-OS by `_resolve_cli`
+  (`bin/{windows,linux,macos}/hyperspatial_cli[.exe]`, flat `bin/` as fallback),
+  so the same plugin works on Windows, Linux and macOS; on Windows the child is
+  launched with `CREATE_NO_WINDOW` to suppress a console flash. The HPC tab's
+  **Backend** dropdown sets `--mode` (`openmp` CPU or `gpu` cross-vendor OpenCL);
+  `gpu` self-falls-back to CPU if no OpenCL GPU is present, so it is always safe
+  to pass.
 * **Progress contract:** the plugin only *displays* stdout; it does not parse
   progress. The final line `RESULT mode=... tiles=... time_sec=...` exists for
   benchmark scraping — keep its shape stable.

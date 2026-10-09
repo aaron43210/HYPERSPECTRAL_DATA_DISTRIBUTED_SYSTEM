@@ -6,12 +6,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Portability: the QGIS plugin ships a *prebuilt* bin/hyperspatial_cli, and a
 # binary compiled with -march=native emits instructions specific to the build
 # machine's CPU — running it on an older/different CPU aborts with SIGILL
-# (illegal instruction). Default to a portable -O3 build. For a machine-local
-# build you can opt back in with -DNATIVE_ARCH=ON.
+# (illegal instruction). Default to a portable optimised build. For a
+# machine-local build you can opt back in with -DNATIVE_ARCH=ON.
+#
+# Flag spellings are compiler-specific. GCC/Clang (Linux, macOS) default to -O0
+# with no build type, so force -O3 (and optional -march=native). MSVC is left
+# alone: its per-config flags already optimise Release (/O2), and injecting /O2
+# into the global flags would collide with the Debug config's /RTC1 (cl : D8016,
+# "/O2 and /RTC1 are incompatible"), breaking Windows Debug builds.
 option(NATIVE_ARCH "Optimise for the local CPU (-march=native); NOT portable" OFF)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
-if(NATIVE_ARCH)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
+if(NOT MSVC)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+    if(NATIVE_ARCH)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
+    endif()
 endif()
 
 find_package(GDAL REQUIRED)
@@ -63,7 +71,11 @@ target_include_directories(hpc_core PUBLIC include)
 target_link_libraries(hpc_core PUBLIC GDAL::GDAL)
 if(USE_OPENCL AND OpenCL_FOUND)
     target_link_libraries(hpc_core PUBLIC OpenCL::OpenCL)
-    target_compile_definitions(hpc_core PUBLIC HSI_HAVE_OPENCL=1)
+    # HSI_HAVE_OPENCL gates the GPU code paths; CL_TARGET_OPENCL_VERSION pins the
+    # API to 1.2 for every platform (matches the in-source guard in
+    # gpu_backend_opencl.cpp) so the Khronos headers on Linux/Windows keep the
+    # 1.x entry points the backend uses.
+    target_compile_definitions(hpc_core PUBLIC HSI_HAVE_OPENCL=1 CL_TARGET_OPENCL_VERSION=120)
 endif()
 
 add_executable(hyperspatial_cli src/main.cpp)

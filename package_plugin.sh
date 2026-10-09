@@ -14,6 +14,15 @@
 # and copying the resulting hyperspatial_cli into qgis-plugin/hyperspatial_bigdata/bin/.
 # Rebuild it on the target architecture; a binary built with -DNATIVE_ARCH=ON is
 # NOT portable to other CPUs.
+#
+# CROSS-PLATFORM: the engine is a native per-OS executable (Windows .exe / Linux
+# ELF / macOS Mach-O) and macOS + Linux even share the file name, so a single flat
+# bin/ cannot hold all three. For a multi-OS plugin, lay the binaries out per OS:
+#     bin/windows/hyperspatial_cli.exe
+#     bin/linux/hyperspatial_cli
+#     bin/macos/hyperspatial_cli
+# The plugin (dialog.py::_resolve_cli) picks the one matching the host, and still
+# accepts a flat bin/hyperspatial_cli[.exe] for a single-OS package.
 
 PLUGIN_DIR="qgis-plugin/hyperspatial_bigdata"
 ZIP_NAME="hyperspatial_bigdata.zip"

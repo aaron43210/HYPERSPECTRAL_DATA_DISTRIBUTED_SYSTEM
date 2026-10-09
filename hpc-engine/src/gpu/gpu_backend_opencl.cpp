@@ -1,19 +1,21 @@
-// =============================================================================
-// gpu_backend_opencl.cpp — OpenCL implementation of the cross-vendor GPU backend
-// =============================================================================
 #include "gpu/gpu_backend_opencl.hpp"
-
-// Pin the OpenCL API to 1.2 BEFORE including the headers. 1.2 is the lowest
-// common denominator supported by every target (Apple, NVIDIA, Intel, AMD) and
-// keeps clCreateCommandQueue (removed from the default surface in 2.0+ headers)
-// available and non-deprecated.
-#define CL_TARGET_OPENCL_VERSION 120
-
 #include <algorithm>
 #include <iostream>
-#include <mutex>
 #include <stdexcept>
 #include <vector>
+#include <cmath>
+#include <mutex>
+
+// Pin the OpenCL API version BEFORE the CL headers are pulled in. 1.2 is the
+// common denominator across Apple, NVIDIA, Intel and AMD. Crucially, the
+// Khronos headers used on Linux and Windows *remove* the 1.x entry points by
+// default (or mark them deprecated) unless this macro is set, which would hide
+// the clCreateCommandQueue call below. Apple's own <OpenCL/cl.h> ignores the
+// macro, so defining it everywhere is safe and keeps the three platforms in
+// sync. The guard lets the build system override it via -D if ever needed.
+#ifndef CL_TARGET_OPENCL_VERSION
+#  define CL_TARGET_OPENCL_VERSION 120
+#endif
 
 #ifdef __APPLE__
 #  include <OpenCL/cl.h>
@@ -24,73 +26,70 @@
 namespace hsi {
 namespace gpu {
 
-// -----------------------------------------------------------------------------
-// Kernel. Computes ONE spectral index per work-item. The math is a line-for-line
-// port of SpectralFeatures.hpp: reflectance is de-scaled by `scale` (10000 for
-// EnMAP L2A), an index is produced ONLY where all of its operand bands are
-// non-zero (0.0 == nodata), the result is clamped to [-1, 1], and nodata pixels
-// are written as 0.0 (NOT NaN) to match the engine's nodata convention.
-// -----------------------------------------------------------------------------
 static const char* KERNEL_SRC = R"CLC(
+#define HSI_NAN (as_float(0x7fc00000u))
+
 __kernel void calc_index(__global const float* red,
                          __global const float* nir,
                          __global const float* green,
                          __global const float* swir,
                          __global const float* blue,
                          __global float*       out,
-                         const int             n,
-                         const int             index_code,
-                         const float           scale)
+                         int                   n,
+                         int                   index_code)
 {
     const int i = get_global_id(0);
     if (i >= n) return;
 
-    // Raw (pre-scale) values; raw == 0 marks nodata / masked bands.
-    const float rr = red[i], rv = nir[i], rg = green[i], rs = swir[i], rb = blue[i];
-    const float inv = 1.0f / scale;
-    const float r = rr * inv, v = rv * inv, g = rg * inv, s = rs * inv, b = rb * inv;
+    // EnMAP L2A data is scaled by 10,000. Convert to 0.0 - 1.0 reflectance.
+    const float r = red ? (red[i] / 10000.0f) : 0.0f;
+    const float v = nir ? (nir[i] / 10000.0f) : 0.0f;
+    const float g = green ? (green[i] / 10000.0f) : 0.0f;
+    const float s = swir ? (swir[i] / 10000.0f) : 0.0f;
+    const float b = blue ? (blue[i] / 10000.0f) : 0.0f;
+    const float eps = 1e-6f;
     const float L = 0.5f;
 
-    float res = 0.0f; // nodata default
-
-    if (index_code == 0) {               // NDVI
-        if (rv != 0.0f && rr != 0.0f) {
-            float d = v + r;
-            if (d != 0.0f) res = clamp((v - r) / d, -1.0f, 1.0f);
-        }
-    } else if (index_code == 1) {        // NDWI
-        if (rg != 0.0f && rv != 0.0f) {
-            float d = g + v;
-            if (d != 0.0f) res = clamp((g - v) / d, -1.0f, 1.0f);
-        }
-    } else if (index_code == 2) {        // NDBI
-        if (rs != 0.0f && rv != 0.0f) {
-            float d = s + v;
-            if (d != 0.0f) res = clamp((s - v) / d, -1.0f, 1.0f);
-        }
-    } else if (index_code == 3) {        // SAVI
-        if (rv != 0.0f && rr != 0.0f) {
-            float d = v + r + L;
-            if (d != 0.0f) res = clamp(((v - r) / d) * (1.0f + L), -1.0f, 1.0f);
-        }
-    } else if (index_code == 4) {        // EVI
-        if (rv != 0.0f && rr != 0.0f && rb != 0.0f) {
-            float d = v + 6.0f * r - 7.5f * b + 1.0f;
-            if (d != 0.0f) res = clamp(2.5f * (v - r) / d, -1.0f, 1.0f);
-        }
-    } else if (index_code == 5) {        // NDMI
-        if (rs != 0.0f && rv != 0.0f) {
-            float d = s + v;
-            if (d != 0.0f) res = clamp((v - s) / d, -1.0f, 1.0f);
-        }
-    } else if (index_code == 6) {        // MSAVI
-        if (rv != 0.0f && rr != 0.0f) {
-            float term = 2.0f * v + 1.0f;
-            float disc = term * term - 8.0f * (v - r);
-            if (disc >= 0.0f) res = clamp((term - sqrt(disc)) * 0.5f, -1.0f, 1.0f);
-        }
+    // A value of 0.0 marks nodata or masked out pixels.
+    if (index_code == 0 || index_code == 3 || index_code == 6) { // NDVI, SAVI, MSAVI (needs nir, red)
+        if (v == 0.0f || r == 0.0f) { out[i] = 0.0f; return; }
+    } else if (index_code == 1) { // NDWI (needs green, nir)
+        if (g == 0.0f || v == 0.0f) { out[i] = 0.0f; return; }
+    } else if (index_code == 2 || index_code == 5) { // NDBI, NDMI (needs swir, nir)
+        if (s == 0.0f || v == 0.0f) { out[i] = 0.0f; return; }
+    } else if (index_code == 4) { // EVI (needs nir, red, blue)
+        if (v == 0.0f || r == 0.0f || b == 0.0f) { out[i] = 0.0f; return; }
     }
-    out[i] = res;
+
+    float result = 0.0f;
+    if (index_code == 0) { // NDVI
+        const float d = v + r;
+        result = (fabs(d) < eps) ? HSI_NAN : (v - r) / d;
+    } else if (index_code == 1) { // NDWI
+        const float d = g + v;
+        result = (fabs(d) < eps) ? HSI_NAN : (g - v) / d;
+    } else if (index_code == 2) { // NDBI
+        const float d = s + v;
+        result = (fabs(d) < eps) ? HSI_NAN : (s - v) / d;
+    } else if (index_code == 3) { // SAVI
+        const float d = v + r + L;
+        result = (fabs(d) < eps) ? HSI_NAN : ((v - r) / d) * (1.0f + L);
+    } else if (index_code == 4) { // EVI
+        const float d = v + 6.0f * r - 7.5f * b + 1.0f;
+        result = (fabs(d) < eps) ? HSI_NAN : 2.5f * (v - r) / d;
+    } else if (index_code == 5) { // NDMI
+        const float d = v + s;
+        result = (fabs(d) < eps) ? HSI_NAN : (v - s) / d;
+    } else if (index_code == 6) { // MSAVI
+        const float term = 2.0f * v + 1.0f;
+        const float disc = term * term - 8.0f * (v - r);
+        result = (disc >= 0.0f) ? (term - sqrt(disc)) / 2.0f : HSI_NAN;
+    } else { // NORMALIZE
+        result = fmin(fmax(r, 0.0f), 1.0f);
+    }
+    
+    // Clamp to -1..1
+    out[i] = fmax(-1.0f, fmin(1.0f, result));
 }
 )CLC";
 
@@ -104,17 +103,20 @@ __kernel void calc_index(__global const float* red,
         }                                                                      \
     } while (0)
 
-// Global OpenCL state. The context/queue/kernel are shared, so GPU dispatch is
-// serialized by g_dispatch_mutex (see compute_spectral_features_gpu).
-static cl_context       g_ctx    = nullptr;
-static cl_command_queue g_queue  = nullptr;
-static cl_program       g_prog   = nullptr;
-static cl_kernel        g_kernel = nullptr;
-static size_t           g_local_size = 256;
-static std::mutex       g_dispatch_mutex;
+static cl_context g_ctx = nullptr;
+static cl_command_queue g_queue = nullptr;
+static cl_program g_prog = nullptr;
+static cl_kernel g_kernel = nullptr;
+static size_t g_local_size = 256;
 
 bool init_opencl() {
-    if (g_ctx) return true; // Already initialized
+    if (g_ctx) return true;
+
+    // Initialisation must never throw out of here: `--mode gpu` is documented to
+    // fall back to the CPU transparently, and both call sites invoke this outside
+    // any try/catch. A present-but-broken GPU/ICD (context/queue/program/kernel
+    // creation failing) must therefore yield `false`, not abort the process.
+    try {
 
     cl_uint num_platforms = 0;
     if (clGetPlatformIDs(0, nullptr, &num_platforms) != CL_SUCCESS || num_platforms == 0)
@@ -123,177 +125,197 @@ bool init_opencl() {
     std::vector<cl_platform_id> platforms(num_platforms);
     clGetPlatformIDs(num_platforms, platforms.data(), nullptr);
 
+    cl_platform_id platform = nullptr;
     cl_device_id device = nullptr;
 
-    // Prefer the first GPU device across all platforms (Apple/NVIDIA/Intel/AMD).
     for (auto p : platforms) {
         cl_uint nd = 0;
         if (clGetDeviceIDs(p, CL_DEVICE_TYPE_GPU, 0, nullptr, &nd) == CL_SUCCESS && nd > 0) {
-            if (clGetDeviceIDs(p, CL_DEVICE_TYPE_GPU, 1, &device, nullptr) == CL_SUCCESS)
-                break;
-            device = nullptr;
+            clGetDeviceIDs(p, CL_DEVICE_TYPE_GPU, 1, &device, nullptr);
+            platform = p;
+            break;
         }
     }
-    if (!device) return false; // no GPU → caller falls back to CPU
+
+    if (!device) return false;
 
     char name[256] = {0};
     clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(name), name, nullptr);
+    std::cout << "[opencl] Initializing Device: " << name << "\n";
 
-    size_t max_wg = 256;
-    clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(max_wg), &max_wg, nullptr);
-    g_local_size = std::min<size_t>(256, max_wg ? max_wg : 1);
+    clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(g_local_size), &g_local_size, nullptr);
+    g_local_size = std::min<size_t>(256, g_local_size);
 
-    cl_int err = CL_SUCCESS;
+    cl_int err;
     g_ctx = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
-    if (err != CL_SUCCESS || !g_ctx) { g_ctx = nullptr; return false; }
+    HSI_CL_CHECK(err);
 
     g_queue = clCreateCommandQueue(g_ctx, device, 0, &err);
-    if (err != CL_SUCCESS || !g_queue) { teardown_opencl(); return false; }
+    HSI_CL_CHECK(err);
 
     g_prog = clCreateProgramWithSource(g_ctx, 1, &KERNEL_SRC, nullptr, &err);
-    if (err != CL_SUCCESS || !g_prog) { teardown_opencl(); return false; }
+    HSI_CL_CHECK(err);
 
-    err = clBuildProgram(g_prog, 1, &device, "-cl-std=CL1.2", nullptr, nullptr);
+    err = clBuildProgram(g_prog, 1, &device, "-cl-fast-relaxed-math", nullptr, nullptr);
     if (err != CL_SUCCESS) {
         size_t log_size = 0;
         clGetProgramBuildInfo(g_prog, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
         std::string log(log_size, '\0');
         if (log_size > 0)
             clGetProgramBuildInfo(g_prog, device, CL_PROGRAM_BUILD_LOG, log_size, &log[0], nullptr);
-        std::cerr << "[opencl] Kernel build failed:\n" << log << "\n";
-        teardown_opencl();
+        std::cerr << "[opencl] Build log:\n" << log << "\n";
         return false;
     }
 
     g_kernel = clCreateKernel(g_prog, "calc_index", &err);
-    if (err != CL_SUCCESS || !g_kernel) { teardown_opencl(); return false; }
+    HSI_CL_CHECK(err);
 
-    std::cout << "[opencl] GPU backend ready on device: " << name << "\n";
     return true;
+
+    } catch (const std::exception& e) {
+        std::cerr << "[opencl] initialisation failed, using CPU: " << e.what() << "\n";
+        teardown_opencl();   // release any partially-created objects
+        return false;
+    }
 }
 
 void teardown_opencl() {
-    if (g_kernel) { clReleaseKernel(g_kernel);        g_kernel = nullptr; }
-    if (g_prog)   { clReleaseProgram(g_prog);         g_prog   = nullptr; }
-    if (g_queue)  { clReleaseCommandQueue(g_queue);   g_queue  = nullptr; }
-    if (g_ctx)    { clReleaseContext(g_ctx);          g_ctx    = nullptr; }
+    if (g_kernel) { clReleaseKernel(g_kernel); g_kernel = nullptr; }
+    if (g_prog)   { clReleaseProgram(g_prog); g_prog = nullptr; }
+    if (g_queue)  { clReleaseCommandQueue(g_queue); g_queue = nullptr; }
+    if (g_ctx)    { clReleaseContext(g_ctx); g_ctx = nullptr; }
 }
 
-bool compute_index_opencl(const RasterChunk& chunk, float* out_index, int index_code) {
-    if (!g_ctx || !g_kernel || !g_queue) return false;
+// Serialises GPU dispatch. The kernel and command queue are process-global
+// singletons and clSetKernelArg on a shared cl_kernel is NOT thread-safe
+// (OpenCL 1.2 §5.9). The engine calls compute_index_opencl from inside the
+// OpenMP tile loop (--mode gpu), so without this lock concurrent tiles would
+// race on the kernel's argument state and corrupt the index bands.
+static std::mutex g_dispatch_mutex;
 
-    const size_t n = static_cast<size_t>(chunk.w) * static_cast<size_t>(chunk.h);
+namespace {
+// Minimal RAII guard so a mid-dispatch failure (or thrown HSI_CL_CHECK) releases
+// every GPU buffer during stack unwinding instead of leaking it in the
+// long-lived context across repeated failing tiles.
+struct ClMem {
+    cl_mem m = nullptr;
+    ClMem() = default;
+    explicit ClMem(cl_mem h) : m(h) {}
+    ~ClMem() { if (m) clReleaseMemObject(m); }
+    ClMem(const ClMem&) = delete;
+    ClMem& operator=(const ClMem&) = delete;
+    ClMem(ClMem&& o) noexcept : m(o.m) { o.m = nullptr; }
+    ClMem& operator=(ClMem&& o) noexcept { if (this != &o) { if (m) clReleaseMemObject(m); m = o.m; o.m = nullptr; } return *this; }
+    operator cl_mem() const { return m; }
+};
+} // namespace
+
+bool compute_index_opencl(const RasterChunk& chunk, float* out_index, int index_code) {
+    if (!g_ctx) return false;
+
+    const size_t n = static_cast<size_t>(chunk.w) * chunk.h;
     if (n == 0) return true;
     const size_t bytes = n * sizeof(float);
 
-    cl_int err = CL_SUCCESS;
-    // Upload a band, or a zero-filled buffer when the band is unavailable (so a
-    // missing operand reads as nodata and the index collapses to 0.0).
-    auto ensure_buf = [&](const float* ptr) -> cl_mem {
+    // Hold the dispatch lock for the whole GPU interaction (buffer setup through
+    // readback) so concurrent OpenMP tiles never share the kernel's arg state.
+    std::lock_guard<std::mutex> lock(g_dispatch_mutex);
+
+    // Any CL failure returns false (not throws) so the caller runs the CPU path
+    // for this tile — the documented per-tile fallback — and RAII frees buffers.
+    try {
+    cl_int err;
+    auto ensure_buf = [&](const float* ptr) -> ClMem {
         if (ptr) {
-            cl_mem m = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                      bytes, const_cast<float*>(ptr), &err);
+            cl_mem m = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bytes, (void*)ptr, &err);
             HSI_CL_CHECK(err);
-            return m;
+            return ClMem(m);
+        } else {
+            cl_mem m = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY, bytes, nullptr, &err);
+            HSI_CL_CHECK(err);
+            ClMem guard(m);
+            std::vector<float> zeros(n, 0.0f);
+            HSI_CL_CHECK(clEnqueueWriteBuffer(g_queue, m, CL_TRUE, 0, bytes, zeros.data(), 0, nullptr, nullptr));
+            return guard;
         }
-        cl_mem m = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY, bytes, nullptr, &err);
-        HSI_CL_CHECK(err);
-        std::vector<float> zeros(n, 0.0f);
-        HSI_CL_CHECK(clEnqueueWriteBuffer(g_queue, m, CL_TRUE, 0, bytes, zeros.data(),
-                                          0, nullptr, nullptr));
-        return m;
     };
 
-    cl_mem buf_red   = ensure_buf(chunk.red);
-    cl_mem buf_nir   = ensure_buf(chunk.nir);
-    cl_mem buf_green = ensure_buf(chunk.green);
-    cl_mem buf_swir  = ensure_buf(chunk.swir);
-    cl_mem buf_blue  = ensure_buf(chunk.blue);
-    cl_mem buf_out   = clCreateBuffer(g_ctx, CL_MEM_WRITE_ONLY, bytes, nullptr, &err);
-    HSI_CL_CHECK(err);
+    ClMem buf_red   = ensure_buf(chunk.red);
+    ClMem buf_nir   = ensure_buf(chunk.nir);
+    ClMem buf_green = ensure_buf(chunk.green);
+    ClMem buf_swir  = ensure_buf(chunk.swir);
+    ClMem buf_blue  = ensure_buf(chunk.blue);
 
-    const int   n_int = static_cast<int>(n);
-    const float scale = (chunk.scale != 0.0f) ? chunk.scale : 1.0f;
-    cl_uint a = 0;
-    HSI_CL_CHECK(clSetKernelArg(g_kernel, a++, sizeof(cl_mem), &buf_red));
-    HSI_CL_CHECK(clSetKernelArg(g_kernel, a++, sizeof(cl_mem), &buf_nir));
-    HSI_CL_CHECK(clSetKernelArg(g_kernel, a++, sizeof(cl_mem), &buf_green));
-    HSI_CL_CHECK(clSetKernelArg(g_kernel, a++, sizeof(cl_mem), &buf_swir));
-    HSI_CL_CHECK(clSetKernelArg(g_kernel, a++, sizeof(cl_mem), &buf_blue));
-    HSI_CL_CHECK(clSetKernelArg(g_kernel, a++, sizeof(cl_mem), &buf_out));
-    HSI_CL_CHECK(clSetKernelArg(g_kernel, a++, sizeof(cl_int), &n_int));
-    HSI_CL_CHECK(clSetKernelArg(g_kernel, a++, sizeof(cl_int), &index_code));
-    HSI_CL_CHECK(clSetKernelArg(g_kernel, a++, sizeof(cl_float), &scale));
+    cl_mem out_raw = clCreateBuffer(g_ctx, CL_MEM_WRITE_ONLY, bytes, nullptr, &err);
+    HSI_CL_CHECK(err);
+    ClMem buf_out(out_raw);
+
+    // clSetKernelArg needs the address of a cl_mem value; take plain handles
+    // from the RAII guards (ownership stays with the guards).
+    cl_mem a_red = buf_red, a_nir = buf_nir, a_green = buf_green,
+           a_swir = buf_swir, a_blue = buf_blue, a_out = buf_out;
+    int arg = 0;
+    int n_int = static_cast<int>(n);
+    HSI_CL_CHECK(clSetKernelArg(g_kernel, arg++, sizeof(cl_mem), &a_red));
+    HSI_CL_CHECK(clSetKernelArg(g_kernel, arg++, sizeof(cl_mem), &a_nir));
+    HSI_CL_CHECK(clSetKernelArg(g_kernel, arg++, sizeof(cl_mem), &a_green));
+    HSI_CL_CHECK(clSetKernelArg(g_kernel, arg++, sizeof(cl_mem), &a_swir));
+    HSI_CL_CHECK(clSetKernelArg(g_kernel, arg++, sizeof(cl_mem), &a_blue));
+    HSI_CL_CHECK(clSetKernelArg(g_kernel, arg++, sizeof(cl_mem), &a_out));
+    HSI_CL_CHECK(clSetKernelArg(g_kernel, arg++, sizeof(cl_int), &n_int));
+    HSI_CL_CHECK(clSetKernelArg(g_kernel, arg++, sizeof(cl_int), &index_code));
 
     const size_t global_size = ((n + g_local_size - 1) / g_local_size) * g_local_size;
-    HSI_CL_CHECK(clEnqueueNDRangeKernel(g_queue, g_kernel, 1, nullptr,
-                                        &global_size, &g_local_size, 0, nullptr, nullptr));
-    HSI_CL_CHECK(clEnqueueReadBuffer(g_queue, buf_out, CL_TRUE, 0, bytes, out_index,
-                                     0, nullptr, nullptr));
+    HSI_CL_CHECK(clEnqueueNDRangeKernel(g_queue, g_kernel, 1, nullptr, &global_size, &g_local_size, 0, nullptr, nullptr));
 
-    clReleaseMemObject(buf_red);
-    clReleaseMemObject(buf_nir);
-    clReleaseMemObject(buf_green);
-    clReleaseMemObject(buf_swir);
-    clReleaseMemObject(buf_blue);
-    clReleaseMemObject(buf_out);
-    return true;
-}
+    HSI_CL_CHECK(clEnqueueReadBuffer(g_queue, a_out, CL_TRUE, 0, bytes, out_index, 0, nullptr, nullptr));
 
-// -----------------------------------------------------------------------------
-// High-level bridge: fill all 7 indices for a tile, matching the CPU reference.
-// -----------------------------------------------------------------------------
-bool compute_spectral_features_gpu(const HyperspectralTile& tile,
-                                   const BandConfig& cfg,
-                                   SpectralFeatureSet& out) {
-    if (!g_ctx) return false;
-    if (tile.bands.empty()) { out.computed = false; return true; }
-
-    const size_t numPixels = tile.bands[0].values.size();
-
-    // Resolve band pointers by 1-based GDAL index, exactly like the CPU path.
-    const float* nir = nullptr; const float* red  = nullptr;
-    const float* grn = nullptr; const float* swir = nullptr; const float* blue = nullptr;
-    for (const auto& bnd : tile.bands) {
-        if (bnd.index == cfg.nir)   nir  = bnd.values.data();
-        if (bnd.index == cfg.red)   red  = bnd.values.data();
-        if (bnd.index == cfg.green) grn  = bnd.values.data();
-        if (bnd.index == cfg.swir)  swir = bnd.values.data();
-        if (bnd.index == cfg.blue)  blue = bnd.values.data();
-    }
-
-    RasterChunk chunk;
-    chunk.w = static_cast<int>(numPixels);   // dispatched as a 1-D range of w*h
-    chunk.h = 1;
-    chunk.red = red; chunk.nir = nir; chunk.green = grn; chunk.swir = swir; chunk.blue = blue;
-    chunk.scale = 10000.0f;
-
-    out.ndvi.assign(numPixels, 0.0f);
-    out.ndwi.assign(numPixels, 0.0f);
-    out.ndbi.assign(numPixels, 0.0f);
-    out.savi.assign(numPixels, 0.0f);
-    out.evi.assign(numPixels, 0.0f);
-    out.ndmi.assign(numPixels, 0.0f);
-    out.msavi.assign(numPixels, 0.0f);
-
-    // Serialize access to the shared kernel/queue so this is safe to call from
-    // the engine's OpenMP tile loop.
-    std::lock_guard<std::mutex> lock(g_dispatch_mutex);
-    try {
-        if (!compute_index_opencl(chunk, out.ndvi.data(),  IDX_NDVI))  return false;
-        if (!compute_index_opencl(chunk, out.ndwi.data(),  IDX_NDWI))  return false;
-        if (!compute_index_opencl(chunk, out.ndbi.data(),  IDX_NDBI))  return false;
-        if (!compute_index_opencl(chunk, out.savi.data(),  IDX_SAVI))  return false;
-        if (!compute_index_opencl(chunk, out.evi.data(),   IDX_EVI))   return false;
-        if (!compute_index_opencl(chunk, out.ndmi.data(),  IDX_NDMI))  return false;
-        if (!compute_index_opencl(chunk, out.msavi.data(), IDX_MSAVI)) return false;
+    return true;  // buffers released by ClMem destructors on scope exit
     } catch (const std::exception& e) {
-        std::cerr << "[opencl] dispatch failed, falling back to CPU: " << e.what() << "\n";
+        std::cerr << "[opencl] dispatch failed, using CPU for this tile: " << e.what() << "\n";
         return false;
     }
+}
 
-    out.computed = true;
-    return true;
+bool compute_spectral_features_gpu(const HyperspectralTile& tile, const BandConfig& config, SpectralFeatureSet& sf) {
+    if (tile.bands.empty() || !g_ctx) return false;
+    
+    const size_t numPixels = tile.bands[0].values.size();
+    
+    // 1. Resize output arrays to match the tile size (initialized to 0.0)
+    sf.ndvi.resize(numPixels, 0.0f);
+    sf.ndwi.resize(numPixels, 0.0f);
+    sf.ndbi.resize(numPixels, 0.0f);
+    sf.savi.resize(numPixels, 0.0f);
+    sf.evi.resize(numPixels, 0.0f);
+    sf.ndmi.resize(numPixels, 0.0f);
+    sf.msavi.resize(numPixels, 0.0f);
+
+    // 2. Map the pointers from the Tile bands to our GPU struct
+    RasterChunk chunk;
+    chunk.w = tile.width();
+    chunk.h = tile.height();
+    
+    for (const auto& b : tile.bands) {
+        if (b.index == config.nir)   chunk.nir   = (float*)b.values.data();
+        if (b.index == config.red)   chunk.red   = (float*)b.values.data();
+        if (b.index == config.green) chunk.green = (float*)b.values.data();
+        if (b.index == config.swir)  chunk.swir  = (float*)b.values.data();
+        if (b.index == config.blue)  chunk.blue  = (float*)b.values.data();
+    }
+
+    // 3. Dispatch to the GPU for each of the 7 indices
+    bool ok = true;
+    ok &= compute_index_opencl(chunk, sf.ndvi.data(), 0);  // NDVI
+    ok &= compute_index_opencl(chunk, sf.ndwi.data(), 1);  // NDWI
+    ok &= compute_index_opencl(chunk, sf.ndbi.data(), 2);  // NDBI
+    ok &= compute_index_opencl(chunk, sf.savi.data(), 3);  // SAVI
+    ok &= compute_index_opencl(chunk, sf.evi.data(), 4);   // EVI
+    ok &= compute_index_opencl(chunk, sf.ndmi.data(), 5);  // NDMI
+    ok &= compute_index_opencl(chunk, sf.msavi.data(), 6); // MSAVI
+    
+    sf.computed = ok;
+    return ok;
 }
 
 } // namespace gpu

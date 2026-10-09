@@ -3,6 +3,7 @@
 # in fixed order: NDVI, NDWI, NDBI, SAVI, EVI, NDMI, MSAVI.
 _N_INDEX_BANDS = 7
 import os
+import sys
 import glob
 import subprocess
 import threading
@@ -261,6 +262,11 @@ class HyperSpatialDialog(QDialog):
         self.cb_backend = QComboBox()
         self.cb_backend.addItem("CPU (OpenMP)", "openmp")
         self.cb_backend.addItem("GPU (OpenCL: Apple/NVIDIA/Intel/AMD)", "gpu")
+        self.cb_backend.setToolTip(
+            "Index compute backend passed to the C++ engine as --mode.\n"
+            "GPU uses cross-vendor OpenCL (Metal on macOS, NVIDIA/Intel/AMD on\n"
+            "Windows and Linux) and transparently falls back to CPU if no OpenCL\n"
+            "GPU is present, so it is always safe to pick.")
         h3.addWidget(self.cb_backend)
         h3.addStretch()
         layout.addLayout(h3)
@@ -276,28 +282,66 @@ class HyperSpatialDialog(QDialog):
         
         self.tab_hpc.setLayout(layout)
 
+    def _resolve_cli(self):
+        """Locate the bundled C++ engine binary for the host OS.
+
+        The engine is a native, per-platform executable: Windows builds produce
+        hyperspatial_cli.exe (PE), Linux builds an ELF, macOS a Mach-O — all
+        three incompatible with each other. macOS and Linux even share the same
+        file name, so they cannot co-exist in a single flat bin/ directory. The
+        cross-platform layout is therefore one sub-folder per OS:
+
+            bin/windows/hyperspatial_cli.exe
+            bin/linux/hyperspatial_cli
+            bin/macos/hyperspatial_cli
+
+        A flat bin/hyperspatial_cli[.exe] is still accepted as a fallback for a
+        single-OS package. Returns (path, error): path is None when no binary
+        matching this platform is bundled, with a message naming what to build.
+        """
+        bin_dir = os.path.join(os.path.dirname(__file__), 'bin')
+        if sys.platform.startswith('win'):
+            plat, exe = 'windows', 'hyperspatial_cli.exe'
+        elif sys.platform == 'darwin':
+            plat, exe = 'macos', 'hyperspatial_cli'
+        else:
+            plat, exe = 'linux', 'hyperspatial_cli'
+
+        for candidate in (os.path.join(bin_dir, plat, exe),
+                          os.path.join(bin_dir, exe)):
+            if os.path.exists(candidate):
+                return candidate, None
+
+        import platform
+        return None, (
+            f"No HPC engine binary bundled for this platform "
+            f"({platform.system()} {platform.machine()}).\n"
+            f"Expected: bin/{plat}/{exe} (or bin/{exe}).\n"
+            f"Build hpc-engine on this OS/arch and copy '{exe}' there.")
+
     def run_hpc(self):
         layer = self.cb_input.currentLayer()
         if not layer or not self.le_output.text():
             QMessageBox.warning(self, "Warning", "Please select an input layer and specify an output directory.")
             return
-            
+
         input_path = layer.dataProvider().dataSourceUri()
         if "|" in input_path: input_path = input_path.split("|")[0]
-            
+
         self.txt_log.clear()
         self.btn_hpc.setEnabled(False)
-        
-        # Locate C++ binary bundled within the plugin
-        cli = os.path.join(os.path.dirname(__file__), 'bin', 'hyperspatial_cli')
-        
-        if not os.path.exists(cli):
-            self.hpc_log.emit("ERROR: Could not find bundled hyperspatial_cli binary.")
+
+        # Locate the C++ binary bundled within the plugin, choosing the variant
+        # that matches the host OS (Windows .exe / Linux / macOS).
+        cli, err = self._resolve_cli()
+        if not cli:
+            self.hpc_log.emit(f"ERROR: {err}")
             self.btn_hpc.setEnabled(True)
             return
-            
+
         # Fix for macOS/Linux [Errno 13] Permission denied after extracting from ZIP.
-        # Best-effort: a read-only install location shouldn't abort the run.
+        # Best-effort: a read-only install location shouldn't abort the run. On
+        # Windows the execute bit is meaningless and chmod is a harmless no-op.
         import stat
         try:
             os.chmod(cli, os.stat(cli).st_mode | stat.S_IEXEC)
@@ -329,7 +373,13 @@ class HyperSpatialDialog(QDialog):
     def _hpc_task(self, cmd, out_dir, is_vrt_mode, selected):
         try:
             self.hpc_log.emit(f"Executing: {' '.join(cmd)}\n")
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            # On Windows, launching a console .exe from the GUI would flash a
+            # console window; CREATE_NO_WINDOW suppresses it. The flag doesn't
+            # exist on POSIX, so it's only added on win32.
+            popen_kw = {}
+            if sys.platform.startswith('win'):
+                popen_kw['creationflags'] = subprocess.CREATE_NO_WINDOW
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **popen_kw)
             for line in iter(proc.stdout.readline, ''):
                 self.hpc_log.emit(line.strip())
             proc.stdout.close()
