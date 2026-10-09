@@ -1,0 +1,89 @@
+name: Build Plugin (Windows / Linux / macOS)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GDAL + OpenCL (vcpkg, x64)
+        run: vcpkg install opencl:x64-windows gdal:x64-windows
+      - name: Build C++ engine (Release, x64)
+        working-directory: hpc-engine
+        run: |
+          mkdir build
+          cd build
+          cmake .. -A x64 -DUSE_OPENCL=ON -DCMAKE_BUILD_TYPE=Release -DVCPKG_TARGET_TRIPLET=x64-windows -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+          cmake --build . --config Release
+      - name: Bundle engine + GDAL/OpenCL DLLs (self-contained)
+        shell: pwsh
+        run: |
+          $bin = "qgis-plugin/hyperspatial_processing/hyperspatial_processing/bin/windows"
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          Copy-Item hpc-engine/build/Release/hyperspatial_cli.exe -Destination $bin/
+          Copy-Item C:/vcpkg/installed/x64-windows/bin/*.dll -Destination $bin/ -ErrorAction SilentlyContinue
+      - name: Package zip
+        shell: pwsh
+        run: Compress-Archive -Path qgis-plugin/hyperspatial_processing/hyperspatial_processing -DestinationPath hyperspatial_processing_windows.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperspatial_processing_windows_plugin
+          path: hyperspatial_processing_windows.zip
+  macos:
+    runs-on: macos-latest   # Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GDAL + OpenMP + dylibbundler
+        run: brew install gdal libomp dylibbundler
+      - name: Build C++ engine (Release)
+        run: |
+          cmake -S hpc-engine -B hpc-engine/build -DUSE_OPENCL=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build hpc-engine/build -j
+      - name: Bundle engine + dylibs (self-contained via @loader_path)
+        run: |
+          BIN=qgis-plugin/hyperspatial_processing/hyperspatial_processing/bin/macos
+          mkdir -p "$BIN"
+          cp hpc-engine/build/hyperspatial_cli "$BIN/"
+          dylibbundler -of -b -x "$BIN/hyperspatial_cli" -d "$BIN/libs" -p @loader_path/libs
+      - name: Package zip
+        run: zip -r hyperspatial_processing_macos.zip qgis-plugin/hyperspatial_processing/hyperspatial_processing
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperspatial_processing_macos_plugin
+          path: hyperspatial_processing_macos.zip
+
+  linux:
+    runs-on: ubuntu-22.04   # older glibc = runs on more distros
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GDAL + OpenCL + OpenMP + tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libgdal-dev libomp-dev opencl-headers ocl-icd-opencl-dev patchelf zip
+      - name: Build C++ engine (Release)
+        run: |
+          cmake -S hpc-engine -B hpc-engine/build -DUSE_OPENCL=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build hpc-engine/build -j
+      - name: Bundle engine + .so deps (rpath $ORIGIN/libs; glibc stays system)
+        run: |
+          BIN=qgis-plugin/hyperspatial_processing/hyperspatial_processing/bin/linux
+          mkdir -p "$BIN/libs"
+          cp hpc-engine/build/hyperspatial_cli "$BIN/"
+          ldd "$BIN/hyperspatial_cli" | awk '/=> \//{print $3}' | while read -r lib; do
+            case "$lib" in
+              */libc.so*|*/libm.so*|*/libpthread*|*/libdl.so*|*/librt.so*|*/ld-linux*|*/libresolv*) ;;
+              *) cp -u "$lib" "$BIN/libs/" ;;
+            esac
+          done
+          patchelf --set-rpath '$ORIGIN/libs' "$BIN/hyperspatial_cli"
+          for f in "$BIN"/libs/*.so*; do patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true; done
+      - name: Package zip
+        run: zip -r hyperspatial_processing_linux.zip qgis-plugin/hyperspatial_processing/hyperspatial_processing
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hyperspatial_processing_linux_plugin
+          path: hyperspatial_processing_linux.zip
