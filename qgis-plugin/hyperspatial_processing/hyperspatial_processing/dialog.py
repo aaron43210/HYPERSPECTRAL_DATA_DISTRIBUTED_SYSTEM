@@ -78,7 +78,7 @@ class HyperspectralProcessingDialog(QDialog):
         # Input raster layer.
         h1 = QHBoxLayout()
         self.cb_input = QgsMapLayerComboBox()
-        self.cb_input.setFilters(QgsMapLayerProxyModel.RasterLayer)
+        self.cb_input.setFilters(QgsMapLayerProxyModel.Filter.RasterLayer)
         h1.addWidget(QLabel("Input Layer:"))
         h1.addWidget(self.cb_input)
         layout.addLayout(h1)
@@ -330,7 +330,7 @@ class HyperspectralProcessingDialog(QDialog):
                 pt = QgsPointXY(point)
 
             provider = layer.dataProvider()
-            res = provider.identify(pt, QgsRaster.IdentifyFormatValue)
+            res = provider.identify(pt, QgsRaster.IdentifyFormat.IdentifyFormatValue)
             if not res or not res.isValid():
                 self.hpc_log.emit("Could not read pixel values at that location (outside the raster?).")
                 return
@@ -588,7 +588,7 @@ class HyperspectralProcessingDialog(QDialog):
                 renderer = layer.renderer()
                 if renderer and hasattr(renderer, "setContrastEnhancement"):
                     enhancement = QgsContrastEnhancement(layer.dataProvider().dataType(1))
-                    enhancement.setContrastEnhancementAlgorithm(QgsContrastEnhancement.StretchToMinimumMaximum)
+                    enhancement.setContrastEnhancementAlgorithm(QgsContrastEnhancement.ContrastEnhancementAlgorithm.StretchToMinimumMaximum)
                     # Indices like NDVI typically range from -1 to 1.
                     enhancement.setMinimumValue(-1.0)
                     enhancement.setMaximumValue(1.0)
@@ -625,7 +625,7 @@ class HyperspectralProcessingDialog(QDialog):
                                  (b, renderer.setBlueContrastEnhancement)):
                 try:
                     ce = QgsContrastEnhancement(provider.dataType(band))
-                    ce.setContrastEnhancementAlgorithm(QgsContrastEnhancement.StretchToMinimumMaximum)
+                    ce.setContrastEnhancementAlgorithm(QgsContrastEnhancement.ContrastEnhancementAlgorithm.StretchToMinimumMaximum)
                     mn, mx = self._band_min_max(provider, band)
                     ce.setMinimumValue(mn)
                     ce.setMaximumValue(mx)
@@ -710,7 +710,7 @@ class HyperspectralProcessingDialog(QDialog):
 
         shader = QgsRasterShader()
         ramp = QgsColorRampShader()
-        ramp.setColorRampType(QgsColorRampShader.Interpolated)
+        ramp.setColorRampType(QgsColorRampShader.Type.Interpolated)
         # Inverted: strongest match (smallest angle) is hot, large angle is cool.
         items = [
             QgsColorRampShader.ColorRampItem(mn, QColor(215, 25, 28), f"{mn:.3f} (strong)"),
