@@ -176,7 +176,22 @@ All results are clamped to `[−1, 1]`. For the normalised-difference indices th
 de-scaling is applied. Division and `sqrt` discriminants are guarded so a
 degenerate denominator or negative discriminant yields `0.0`, not NaN/Inf.
 
-### 1.6 Concurrency, thread-safety & error model
+### 1.6 Advanced Hyperspectral Operations (PCA & SAM)
+
+In addition to the standard 7 multi-spectral indices, the engine natively supports two true **Hyperspectral** operations that utilise the entire 224-band spectrum:
+
+1. **Principal Component Analysis (PCA)** (`--operation pca`):
+   - Compresses the full 224-band variance down to `N` dominant components (default: 3).
+   - Generates `pca.tif` and a `pca_eigen.csv` log of the variance explained by each PC.
+   - GPU execution uses a Kahan-compensated parallel reduction for the massive covariance matrix calculation to avoid `float32` drift on macOS.
+
+2. **Spectral Angle Mapper (SAM)** (`--operation sam`):
+   - Computes the N-dimensional angular distance between every pixel and a user-defined reference spectrum (`--sam-spectrum "v1,v2,v3..."`).
+   - Produces `sam_angle.tif` (raw radians), `sam_mask.tif` (boolean classification mask based on `--sam-threshold`), and `sam_similarity.tif` (1.0 - angle/pi).
+
+Both operations fully support OpenMP CPU threading and OpenCL GPU acceleration, bypassing the normal index routines entirely.
+
+### 1.7 Concurrency, thread-safety & error model
 
 * **GDAL handles are per-thread.** `readTile` opens its own `GDALDataset`; handles
   are never shared across threads. `TileWriter::writeGeoTIFF` creates a distinct
