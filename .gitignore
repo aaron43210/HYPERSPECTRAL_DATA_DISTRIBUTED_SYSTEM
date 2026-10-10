@@ -32,3 +32,6 @@ metastore_db/
 !qgis-plugin/hyperspatial_bigdata/bin/hyperspatial_cli
 
 qgis-plugin/*/*.zip
+
+*.zip
+qgis-plugin/hyperspatial_bigdata/bin/
