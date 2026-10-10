@@ -335,9 +335,16 @@ class HyperspectralProcessingDialog(QDialog):
                 self.hpc_log.emit("Could not read pixel values at that location (outside the raster?).")
                 return
             results = res.results()  # {band_number: value}, 1-based band keys
-            spectrum = [results[b] for b in sorted(results.keys())]
-            if not spectrum or any(v is None for v in spectrum):
-                self.hpc_log.emit("Pixel contains nodata; pick a different location.")
+            # Per-band nodata comes back as None/NaN. The engine treats nodata as
+            # 0.0 (NoDataHandler) and SAM only ignores a pixel when ALL bands are
+            # nodata. So map None/NaN -> 0.0 and reject only a fully-nodata pixel
+            # (the scene's black border) — NOT a valid pixel that happens to have
+            # a few bad/nodata bands, which would otherwise reject most real pixels.
+            raw = [results[b] for b in sorted(results.keys())]
+            spectrum = [0.0 if (v is None or v != v) else float(v) for v in raw]
+            if not spectrum or all(v == 0.0 for v in spectrum):
+                self.hpc_log.emit("That pixel is all-nodata (likely the black border) — "
+                                  "click on the actual image.")
                 return
 
             # Best-effort row/col for the confirmation message only (the spectrum

@@ -545,24 +545,13 @@ int main(int argc, char** argv) {
         try { runPCA(args, reader, tiles, use_gpu, failed, firstError); }
         catch (const std::exception& e) { failed = true; firstError = e.what(); }
     } else if (args.operation == "indices") {
-    std::mutex csvMutex;
     std::filesystem::create_directories(args.output);
-    const std::string summaryCsvPath = args.output + "/summary.csv";
 
-    // Fresh-run hygiene. summary.csv is opened in append mode (so OpenMP threads
-    // can each add their tile rows), and tiles are written to deterministic
-    // tile_r####_c####.tif names. Without clearing prior outputs first, re-running
-    // the engine into an existing directory would:
-    //   (1) append a *second* full set of rows to summary.csv — doubling every
-    //       tile for the Spark/Sedona layer, which silently inflates counts and
-    //       spatial-join results; and
-    //   (2) leave stale tile_*.tif from an earlier, possibly differently-tiled
-    //       scene that the QGIS plugin's gdalbuildvrt step would then fold into
-    //       the mosaic.
-    // Remove only files this engine itself produces (summary.csv and tile_r*).
+    // Fresh-run hygiene: clear stale tile_*.tif from an earlier (possibly
+    // differently-tiled) scene so the QGIS plugin's gdalbuildvrt step can't fold
+    // them into the new mosaic. Remove only files this engine itself produces.
     {
         std::error_code ec;
-        std::filesystem::remove(summaryCsvPath, ec);
         // Collect first, then remove — mutating a directory while iterating it
         // with directory_iterator is unspecified behaviour.
         std::vector<std::filesystem::path> stale;
@@ -620,8 +609,7 @@ int main(int argc, char** argv) {
 
         TileWriteResult wr = TileWriter::writeGeoTIFF(tile, sf, args.output,
                                  tiles[i].rowStart, tiles[i].colStart);
-        TileWriter::appendSummaryCSV(tile, sf, wr, summaryCsvPath,
-                                     tiles[i].rowStart, tiles[i].colStart, csvMutex);
+        (void)wr;  // kept for its throw-on-write-failure side effect; summary.csv dropped
 
         size_t n = ++done;
         if (n % 10 == 0 || n == tiles.size())
