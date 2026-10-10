@@ -21,6 +21,7 @@ import os
 import sys
 import glob
 import stat
+import tempfile
 import subprocess
 import threading
 import multiprocessing
@@ -74,7 +75,7 @@ class HyperspectralProcessingDialog(QDialog):
         # Output directory.
         h2 = QHBoxLayout()
         self.le_output = QLineEdit()
-        self.le_output.setPlaceholderText("Output Directory for Tiles and VRT")
+        self.le_output.setPlaceholderText("Output Directory (leave blank for QGIS temporary scratch space)")
         btn_out = QPushButton("Browse")
         btn_out.clicked.connect(lambda: self.le_output.setText(QFileDialog.getExistingDirectory(self, "Select Output Folder")))
         h2.addWidget(QLabel("Output:"))
@@ -181,8 +182,8 @@ class HyperspectralProcessingDialog(QDialog):
     # ------------------------------------------------------------------ run
     def run_hpc(self):
         layer = self.cb_input.currentLayer()
-        if not layer or not self.le_output.text():
-            QMessageBox.warning(self, "Warning", "Please select an input layer and specify an output directory.")
+        if not layer:
+            QMessageBox.warning(self, "Warning", "Please select an input raster layer.")
             return
 
         input_path = layer.dataProvider().dataSourceUri()
@@ -191,6 +192,24 @@ class HyperspectralProcessingDialog(QDialog):
 
         self.txt_log.clear()
         self.btn_hpc.setEnabled(False)
+
+        # Output folder: use what the user typed, or fall back to a private
+        # subfolder of QGIS's own temporary scratch space. QgsProcessingUtils
+        # .tempFolder() honours the user's QGIS temp setting and is managed by
+        # QGIS; mkdtemp gives each run its own subfolder so the engine's
+        # clear-prior-outputs step can never touch unrelated files. Nothing is
+        # deleted while this run's layers are open — QGIS reclaims its temp space
+        # on its own terms.
+        out_dir = self.le_output.text().strip()
+        if not out_dir:
+            try:
+                from qgis.core import QgsProcessingUtils
+                base = QgsProcessingUtils.tempFolder()
+            except Exception:
+                base = tempfile.gettempdir()
+            out_dir = tempfile.mkdtemp(prefix="hyperspatial_", dir=base)
+            self.le_output.setText(out_dir)
+            self.hpc_log.emit(f"No output folder set - using QGIS temporary scratch: {out_dir}")
 
         # Resolve the EXTERNAL engine. Binary-free plugin: if it is not set in
         # QSettings, on PATH, or bundled (dev only), explain how to provide it and
