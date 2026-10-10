@@ -308,7 +308,7 @@ class HyperspectralProcessingDialog(QDialog):
         h3.addStretch()
         layout.addLayout(h3)
 
-        self.btn_hpc = QPushButton("RUN HPC C++ ENGINE")
+        self.btn_hpc = QPushButton("RUN")
         self.btn_hpc.setStyleSheet("background-color: #007bff; color: white; font-weight: bold;")
         self.btn_hpc.clicked.connect(self.run_hpc)
         layout.addWidget(self.btn_hpc)
