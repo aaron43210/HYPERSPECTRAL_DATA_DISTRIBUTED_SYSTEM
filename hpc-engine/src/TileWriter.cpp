@@ -208,3 +208,62 @@ void TileWriter::appendSummaryCSV(const HyperspectralTile& tile,
       << writeResult.firstIndexBand << ","
       << "\"" << wkt.str() << "\"\n";
 }
+
+// =============================================================================
+// SceneRaster  —  scene-sized GeoTIFF written window-by-window (SAM / PCA)
+// =============================================================================
+
+SceneRaster::SceneRaster(const std::string& path, int cols, int rows, int nbands,
+                         Type type, const double* geoTransform,
+                         const std::string& wkt, double nodata,
+                         const std::vector<std::string>& bandDescriptions)
+{
+    GDALAllRegister();
+    GDALDriver* driver = GetGDALDriverManager()->GetDriverByName("GTiff");
+    if (!driver) throw std::runtime_error("GTiff driver not available");
+
+    char** opts = nullptr;
+    opts = CSLSetNameValue(opts, "COMPRESS", "LZW");
+    opts = CSLSetNameValue(opts, "TILED", "YES");
+
+    const GDALDataType dt = (type == Type::Byte) ? GDT_Byte : GDT_Float32;
+    ds_ = driver->Create(path.c_str(), cols, rows, nbands, dt, opts);
+    CSLDestroy(opts);
+    if (!ds_) throw std::runtime_error("Cannot create scene raster: " + path);
+
+    ds_->SetGeoTransform(const_cast<double*>(geoTransform));
+    if (!wkt.empty()) ds_->SetProjection(wkt.c_str());
+
+    for (int b = 1; b <= nbands; ++b) {
+        GDALRasterBand* rb = ds_->GetRasterBand(b);
+        rb->SetNoDataValue(nodata);
+        if (b - 1 < static_cast<int>(bandDescriptions.size()))
+            rb->SetDescription(bandDescriptions[b - 1].c_str());
+    }
+}
+
+SceneRaster::~SceneRaster() { finalize(); }
+
+void SceneRaster::finalize() {
+    if (ds_) { GDALClose(ds_); ds_ = nullptr; }
+}
+
+void SceneRaster::writeWindow(int band0, int colStart, int rowStart,
+                              int w, int h, const float* data) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    CPLErr err = ds_->GetRasterBand(band0 + 1)->RasterIO(
+        GF_Write, colStart, rowStart, w, h,
+        const_cast<float*>(data), w, h, GDT_Float32, 0, 0);
+    if (err != CE_None)
+        throw std::runtime_error("SceneRaster float window write failed");
+}
+
+void SceneRaster::writeWindow(int band0, int colStart, int rowStart,
+                              int w, int h, const unsigned char* data) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    CPLErr err = ds_->GetRasterBand(band0 + 1)->RasterIO(
+        GF_Write, colStart, rowStart, w, h,
+        const_cast<unsigned char*>(data), w, h, GDT_Byte, 0, 0);
+    if (err != CE_None)
+        throw std::runtime_error("SceneRaster byte window write failed");
+}

@@ -21,6 +21,7 @@ import os
 import sys
 import glob
 import stat
+import math
 import tempfile
 import subprocess
 import threading
@@ -29,7 +30,7 @@ import multiprocessing
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QMessageBox, QCheckBox, QComboBox, QTextEdit, QFileDialog,
-    QRadioButton, QSpinBox
+    QRadioButton, QSpinBox, QDoubleSpinBox, QStackedWidget, QWidget
 )
 from qgis.PyQt.QtCore import pyqtSignal, QSettings
 from osgeo import gdal
@@ -49,6 +50,16 @@ class HyperspectralProcessingDialog(QDialog):
         self.iface = iface
         self.setWindowTitle('HyperSpectral Processer')
         self.resize(820, 560)
+
+        # SAM reference spectrum captured by clicking a pixel on the map canvas.
+        # Populated on the GUI thread by _on_sam_canvas_clicked; read in run_hpc.
+        self._sam_spectrum = None
+        self._sam_rc = None
+        self._sam_pick_tool = None
+        # Operation + SAM threshold captured on the GUI thread at RUN time so the
+        # finished-slot can pick renderers without re-reading operation widgets.
+        self._last_operation = "indices"
+        self._sam_threshold = None
 
         self.init_hpc_ui()
 
@@ -98,7 +109,26 @@ class HyperspectralProcessingDialog(QDialog):
         he.addWidget(btn_engine)
         layout.addLayout(he)
 
-        # Index selection (fixed order NDVI,NDWI,NDBI,SAVI,EVI,NDMI,MSAVI).
+        # ---- Operation selector + per-operation page stack ------------------
+        # One dialog, no clutter: a combo chooses the operation and the stacked
+        # widget shows only that operation's controls. The SHARED controls
+        # (input, output, engine, format, cores, backend, RUN, log) stay OUTSIDE
+        # the stack so they apply to every operation.
+        hop = QHBoxLayout()
+        self.cb_operation = QComboBox()
+        self.cb_operation.addItem("Spectral Indices", "indices")
+        self.cb_operation.addItem("PCA (false-colour composite)", "pca")
+        self.cb_operation.addItem("Target Detection (SAM)", "sam")
+        hop.addWidget(QLabel("Operation:"))
+        hop.addWidget(self.cb_operation)
+        hop.addStretch()
+        layout.addLayout(hop)
+
+        self.stack_op = QStackedWidget()
+
+        # --- Page 0: Spectral indices (fixed order NDVI..MSAVI) --------------
+        page_indices = QWidget()
+        pi = QVBoxLayout(page_indices)
         opt = QHBoxLayout()
         self.chk_ndvi = QCheckBox("NDVI"); self.chk_ndvi.setChecked(True)
         self.chk_ndwi = QCheckBox("NDWI"); self.chk_ndwi.setChecked(True)
@@ -110,7 +140,81 @@ class HyperspectralProcessingDialog(QDialog):
         for w in (self.chk_ndvi, self.chk_ndwi, self.chk_ndbi, self.chk_savi,
                   self.chk_evi, self.chk_ndmi, self.chk_msavi):
             opt.addWidget(w)
-        layout.addLayout(opt)
+        opt.addStretch()
+        pi.addWidget(QLabel("Spectral indices to compute (fixed band order):"))
+        pi.addLayout(opt)
+        pi.addStretch()
+        self.stack_op.addWidget(page_indices)
+
+        # --- Page 1: PCA -----------------------------------------------------
+        page_pca = QWidget()
+        pp = QVBoxLayout(page_pca)
+        hpca = QHBoxLayout()
+        hpca.addWidget(QLabel("Components (PC bands):"))
+        self.spin_pca_components = QSpinBox()
+        self.spin_pca_components.setRange(1, 224)
+        self.spin_pca_components.setValue(3)
+        self.spin_pca_components.setToolTip(
+            "Number of principal components (PC1..PCk) the engine writes to pca.tif.\n"
+            "3 gives an RGB false-colour composite out of the box.")
+        hpca.addWidget(self.spin_pca_components)
+        hpca.addStretch()
+        pp.addLayout(hpca)
+        self.chk_pca_correlation = QCheckBox("Use correlation matrix (advanced)")
+        self.chk_pca_correlation.setChecked(False)
+        self.chk_pca_correlation.setToolTip(
+            "Off (default): covariance matrix. On: correlation matrix, which\n"
+            "normalises per-band variance before decomposition.")
+        pp.addWidget(self.chk_pca_correlation)
+        pp.addStretch()
+        self.stack_op.addWidget(page_pca)
+
+        # --- Page 2: Target Detection (SAM) ----------------------------------
+        page_sam = QWidget()
+        ps = QVBoxLayout(page_sam)
+        hsam1 = QHBoxLayout()
+        self.btn_sam_pick = QPushButton("Pick reference pixel")
+        self.btn_sam_pick.setToolTip(
+            "Click, then click a pixel on the map canvas. All band values at that\n"
+            "pixel become the SAM reference spectrum.")
+        self.btn_sam_pick.clicked.connect(self._activate_sam_picker)
+        self.lbl_sam_ref = QLabel("No reference captured.")
+        hsam1.addWidget(self.btn_sam_pick)
+        hsam1.addWidget(self.lbl_sam_ref)
+        hsam1.addStretch()
+        ps.addLayout(hsam1)
+
+        hsam2 = QHBoxLayout()
+        hsam2.addWidget(QLabel("Max angle:"))
+        self.spin_sam_angle = QDoubleSpinBox()
+        self.spin_sam_angle.setRange(0.0, 1.57)
+        self.spin_sam_angle.setValue(0.10)
+        self.spin_sam_angle.setSingleStep(0.01)
+        self.spin_sam_angle.setSuffix(" rad")
+        self.spin_sam_angle.valueChanged.connect(self._update_sam_angle_label)
+        hsam2.addWidget(self.spin_sam_angle)
+        self.lbl_sam_degrees = QLabel("")
+        hsam2.addWidget(self.lbl_sam_degrees)
+        hsam2.addStretch()
+        ps.addLayout(hsam2)
+        self._update_sam_angle_label(self.spin_sam_angle.value())
+
+        self.chk_sam_mask = QCheckBox("Write detection mask (applies Max angle threshold)")
+        self.chk_sam_mask.setChecked(True)
+        self.chk_sam_mask.setToolTip(
+            "On: pass --sam-threshold so the engine also writes a 0/1 sam_mask.tif.")
+        ps.addWidget(self.chk_sam_mask)
+        self.chk_sam_similarity = QCheckBox("Write similarity band")
+        self.chk_sam_similarity.setChecked(False)
+        self.chk_sam_similarity.setToolTip(
+            "On: pass --sam-emit-similarity so the engine also writes sam_similarity.tif.")
+        ps.addWidget(self.chk_sam_similarity)
+        ps.addStretch()
+        self.stack_op.addWidget(page_sam)
+
+        layout.addWidget(self.stack_op)
+        self.cb_operation.currentIndexChanged.connect(self.stack_op.setCurrentIndex)
+        self.stack_op.setCurrentIndex(0)
         # Output format.
         fmt = QVBoxLayout()
         fmt.addWidget(QLabel("Output Format:"))
@@ -179,6 +283,85 @@ class HyperspectralProcessingDialog(QDialog):
         if path:
             QSettings().setValue(ENGINE_SETTINGS_KEY, path)
             self._refresh_engine_display()
+
+    # --------------------------------------------------------------- SAM pick
+    def _update_sam_angle_label(self, value):
+        """Live degree equivalent for the Max-angle (radians) spin box."""
+        try:
+            self.lbl_sam_degrees.setText(f"≈ {math.degrees(value):.1f}°")
+        except Exception:
+            self.lbl_sam_degrees.setText("")
+
+    def _activate_sam_picker(self):
+        """Arm a QgsMapToolEmitPoint so the next canvas click captures a spectrum."""
+        layer = self.cb_input.currentLayer()
+        if not layer:
+            QMessageBox.warning(self, "Warning",
+                                "Select an input raster layer before picking a reference pixel.")
+            return
+        try:
+            from qgis.gui import QgsMapToolEmitPoint
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Map tool unavailable: {e}")
+            return
+        self._sam_pick_tool = QgsMapToolEmitPoint(self.iface.mapCanvas())
+        self._sam_pick_tool.canvasClicked.connect(self._on_sam_canvas_clicked)
+        self.iface.mapCanvas().setMapTool(self._sam_pick_tool)
+        self.hpc_log.emit("Pick reference pixel: click a point on the map canvas...")
+
+    def _on_sam_canvas_clicked(self, point, button):
+        """Read every band value at the clicked pixel into the SAM reference spectrum."""
+        try:
+            layer = self.cb_input.currentLayer()
+            if not layer:
+                return
+            from qgis.core import (QgsRaster, QgsProject, QgsPointXY,
+                                   QgsCoordinateTransform)
+            # Canvas CRS -> layer CRS so the identify hits the right pixel.
+            pt = QgsPointXY(point)
+            try:
+                canvas_crs = self.iface.mapCanvas().mapSettings().destinationCrs()
+                layer_crs = layer.crs()
+                if canvas_crs != layer_crs:
+                    xform = QgsCoordinateTransform(canvas_crs, layer_crs,
+                                                   QgsProject.instance())
+                    pt = xform.transform(pt)
+            except Exception:
+                pt = QgsPointXY(point)
+
+            provider = layer.dataProvider()
+            res = provider.identify(pt, QgsRaster.IdentifyFormatValue)
+            if not res or not res.isValid():
+                self.hpc_log.emit("Could not read pixel values at that location (outside the raster?).")
+                return
+            results = res.results()  # {band_number: value}, 1-based band keys
+            spectrum = [results[b] for b in sorted(results.keys())]
+            if not spectrum or any(v is None for v in spectrum):
+                self.hpc_log.emit("Pixel contains nodata; pick a different location.")
+                return
+
+            # Best-effort row/col for the confirmation message only (the spectrum
+            # itself is sent to the engine via --sam-spectrum).
+            try:
+                extent = layer.extent()
+                col = int((pt.x() - extent.xMinimum()) / layer.rasterUnitsPerPixelX())
+                row = int((extent.yMaximum() - pt.y()) / layer.rasterUnitsPerPixelY())
+            except Exception:
+                row, col = -1, -1
+
+            self._sam_spectrum = [float(v) for v in spectrum]
+            self._sam_rc = (row, col)
+            self.lbl_sam_ref.setText(f"Reference: {len(self._sam_spectrum)} bands @ row {row}, col {col}")
+            self.hpc_log.emit(
+                f"Reference captured: {len(self._sam_spectrum)} bands at row {row}, col {col}.")
+        except Exception as e:
+            self.hpc_log.emit(f"Reference capture failed: {e}")
+        finally:
+            try:
+                if self._sam_pick_tool is not None:
+                    self.iface.mapCanvas().unsetMapTool(self._sam_pick_tool)
+            except Exception:
+                pass
     # ------------------------------------------------------------------ run
     def run_hpc(self):
         layer = self.cb_input.currentLayer()
@@ -230,13 +413,38 @@ class HyperspectralProcessingDialog(QDialog):
         except OSError as e:
             self.hpc_log.emit(f"Warning: could not set execute bit on binary: {e}")
 
+        # Capture ALL widget state on the GUI thread BEFORE starting the worker.
+        operation = self.cb_operation.currentData()
+        self._last_operation = operation
+        self._sam_threshold = None
+
         cmd = [
             cli,
             "--input", input_path,
             "--output", self.le_output.text(),
             "--threads", str(self.spin_threads.value()),
             "--mode", self.cb_backend.currentData(),
+            "--operation", operation,
         ]
+
+        if operation == "pca":
+            cmd += ["--pca-components", str(self.spin_pca_components.value())]
+            if self.chk_pca_correlation.isChecked():
+                cmd += ["--pca-matrix", "correlation"]
+
+        elif operation == "sam":
+            if not self._sam_spectrum:
+                QMessageBox.warning(
+                    self, "No reference spectrum",
+                    "Pick a reference pixel on the map before running SAM target detection.")
+                self.btn_hpc.setEnabled(True)
+                return
+            cmd += ["--sam-spectrum", ",".join(repr(v) for v in self._sam_spectrum)]
+            if self.chk_sam_mask.isChecked():
+                self._sam_threshold = float(self.spin_sam_angle.value())
+                cmd += ["--sam-threshold", str(self._sam_threshold)]
+            if self.chk_sam_similarity.isChecked():
+                cmd += ["--sam-emit-similarity"]
 
         is_vrt_mode = self.radio_out_vrt.isChecked()
         # Capture checkbox state HERE (GUI thread). Qt widgets must not be read
@@ -249,9 +457,10 @@ class HyperspectralProcessingDialog(QDialog):
             self.chk_msavi.isChecked(),
         ]
         threading.Thread(target=self._hpc_task,
-                         args=(cmd, self.le_output.text(), is_vrt_mode, selected),
+                         args=(cmd, self.le_output.text(), is_vrt_mode, selected, operation),
                          daemon=True).start()
-    def _hpc_task(self, cmd, out_dir, is_vrt_mode, selected):
+
+    def _hpc_task(self, cmd, out_dir, is_vrt_mode, selected, operation):
         try:
             self.hpc_log.emit(f"Executing: {' '.join(cmd)}\n")
             # On Windows, launching a console .exe from the GUI would flash a
@@ -269,9 +478,12 @@ class HyperspectralProcessingDialog(QDialog):
             proc.stdout.close()
             proc.wait()
 
-            # Post-processing merge & cleanup (background thread).
+            # Post-processing merge & cleanup (background thread). Only spectral
+            # indices are written as per-tile chunks that need VRT merging; PCA
+            # and SAM write their final GeoTIFFs (pca.tif / sam_angle.tif ...)
+            # directly, so they skip this block entirely.
             tiles = sorted(glob.glob(os.path.join(out_dir, "tile_*.tif")))
-            if tiles:
+            if operation == "indices" and tiles:
                 self.hpc_log.emit("\nMerging output tiles into single-index layers...")
                 ds = gdal.Open(tiles[0])
                 if ds is None:
@@ -330,40 +542,178 @@ class HyperspectralProcessingDialog(QDialog):
         # load below raises for any layer.
         try:
             self.hpc_log.emit("\n--- HPC COMPLETE ---")
-            if self.chk_canvas.isChecked():
-                self.hpc_log.emit("Loading computed index layers into canvas...")
+            if not self.chk_canvas.isChecked():
+                return
 
-                layers_to_load = []
-                is_vrt = self.radio_out_vrt.isChecked()
-                ext = ".vrt" if is_vrt else ".tif"
-
-                if self.chk_ndvi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"ndvi_layer{ext}"), "Computed NDVI"))
-                if self.chk_ndwi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"ndwi_layer{ext}"), "Computed NDWI"))
-                if self.chk_ndbi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"ndbi_layer{ext}"), "Computed NDBI"))
-                if self.chk_savi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"savi_layer{ext}"), "Computed SAVI"))
-                if self.chk_evi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"evi_layer{ext}"), "Computed EVI"))
-                if self.chk_ndmi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"ndmi_layer{ext}"), "Computed NDMI"))
-                if self.chk_msavi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"msavi_layer{ext}"), "Computed MSAVI"))
-
-                for path, name in layers_to_load:
-                    if not os.path.exists(path):
-                        continue
-                    # iface.addRasterLayer guarantees the layer lands in the layer
-                    # tree (legend) + canvas, not just the project registry.
-                    layer = self.iface.addRasterLayer(path, name)
-                    if layer and layer.isValid():
-                        from qgis.core import QgsContrastEnhancement
-                        renderer = layer.renderer()
-                        if renderer:
-                            enhancement = QgsContrastEnhancement(layer.dataProvider().dataType(1))
-                            enhancement.setContrastEnhancementAlgorithm(QgsContrastEnhancement.StretchToMinimumMaximum)
-                            # Indices like NDVI typically range from -1 to 1.
-                            enhancement.setMinimumValue(-1.0)
-                            enhancement.setMaximumValue(1.0)
-                            renderer.setContrastEnhancement(enhancement)
-
-                        layer.triggerRepaint()
-                        self.iface.mapCanvas().refresh()
-                        self.hpc_log.emit(f"Loaded {name} to map canvas.")
+            operation = self._last_operation
+            if operation == "pca":
+                self._load_pca_outputs(out_dir)
+            elif operation == "sam":
+                self._load_sam_outputs(out_dir)
+            else:
+                self._load_index_outputs(out_dir)
         finally:
             self.btn_hpc.setEnabled(True)
+
+    def _load_index_outputs(self, out_dir):
+        self.hpc_log.emit("Loading computed index layers into canvas...")
+
+        layers_to_load = []
+        is_vrt = self.radio_out_vrt.isChecked()
+        ext = ".vrt" if is_vrt else ".tif"
+
+        if self.chk_ndvi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"ndvi_layer{ext}"), "Computed NDVI"))
+        if self.chk_ndwi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"ndwi_layer{ext}"), "Computed NDWI"))
+        if self.chk_ndbi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"ndbi_layer{ext}"), "Computed NDBI"))
+        if self.chk_savi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"savi_layer{ext}"), "Computed SAVI"))
+        if self.chk_evi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"evi_layer{ext}"), "Computed EVI"))
+        if self.chk_ndmi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"ndmi_layer{ext}"), "Computed NDMI"))
+        if self.chk_msavi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"msavi_layer{ext}"), "Computed MSAVI"))
+
+        for path, name in layers_to_load:
+            if not os.path.exists(path):
+                continue
+            # iface.addRasterLayer guarantees the layer lands in the layer
+            # tree (legend) + canvas, not just the project registry.
+            layer = self.iface.addRasterLayer(path, name)
+            if layer and layer.isValid():
+                from qgis.core import QgsContrastEnhancement
+                renderer = layer.renderer()
+                if renderer and hasattr(renderer, "setContrastEnhancement"):
+                    enhancement = QgsContrastEnhancement(layer.dataProvider().dataType(1))
+                    enhancement.setContrastEnhancementAlgorithm(QgsContrastEnhancement.StretchToMinimumMaximum)
+                    # Indices like NDVI typically range from -1 to 1.
+                    enhancement.setMinimumValue(-1.0)
+                    enhancement.setMaximumValue(1.0)
+                    renderer.setContrastEnhancement(enhancement)
+
+                layer.triggerRepaint()
+                self.iface.mapCanvas().refresh()
+                self.hpc_log.emit(f"Loaded {name} to map canvas.")
+
+    def _load_pca_outputs(self, out_dir):
+        """Load pca.tif as a 3-band false-colour composite (PC1/PC2/PC3 -> R/G/B)."""
+        eigen = os.path.join(out_dir, "pca_eigen.csv")
+        if os.path.exists(eigen):
+            self.hpc_log.emit(f"Eigenvalues/vectors written to {eigen}")
+
+        path = os.path.join(out_dir, "pca.tif")
+        if not os.path.exists(path):
+            self.hpc_log.emit("PCA finished but pca.tif was not found in the output folder.")
+            return
+        layer = self.iface.addRasterLayer(path, "PCA Composite")
+        if not (layer and layer.isValid()):
+            self.hpc_log.emit("PCA output pca.tif could not be loaded as a raster layer.")
+            return
+        try:
+            from qgis.core import QgsMultiBandColorRenderer, QgsContrastEnhancement
+            provider = layer.dataProvider()
+            nbands = provider.bandCount()
+            r = 1
+            g = 2 if nbands >= 2 else 1
+            b = 3 if nbands >= 3 else g
+            renderer = QgsMultiBandColorRenderer(provider, r, g, b)
+            for band, setter in ((r, renderer.setRedContrastEnhancement),
+                                 (g, renderer.setGreenContrastEnhancement),
+                                 (b, renderer.setBlueContrastEnhancement)):
+                try:
+                    ce = QgsContrastEnhancement(provider.dataType(band))
+                    ce.setContrastEnhancementAlgorithm(QgsContrastEnhancement.StretchToMinimumMaximum)
+                    mn, mx = self._band_min_max(provider, band)
+                    ce.setMinimumValue(mn)
+                    ce.setMaximumValue(mx)
+                    setter(ce)
+                except Exception as e:
+                    self.hpc_log.emit(f"PCA band {band} stretch skipped: {e}")
+            layer.setRenderer(renderer)
+            layer.triggerRepaint()
+            self.iface.mapCanvas().refresh()
+            self.hpc_log.emit(f"Loaded PCA false-colour composite (PC{r}/PC{g}/PC{b} -> R/G/B).")
+        except Exception as e:
+            self.hpc_log.emit(f"PCA renderer skipped (layer still loaded): {e}")
+
+    def _load_sam_outputs(self, out_dir):
+        """Load sam_angle.tif (inverted ramp) plus optional mask / similarity bands."""
+        path = os.path.join(out_dir, "sam_angle.tif")
+        if not os.path.exists(path):
+            self.hpc_log.emit("SAM finished but sam_angle.tif was not found in the output folder.")
+        else:
+            layer = self.iface.addRasterLayer(path, "SAM Angle (rad)")
+            if layer and layer.isValid():
+                try:
+                    self._apply_sam_angle_renderer(layer)
+                    layer.triggerRepaint()
+                    self.iface.mapCanvas().refresh()
+                    self.hpc_log.emit("Loaded SAM angle layer (small angle = strong match).")
+                except Exception as e:
+                    self.hpc_log.emit(f"SAM angle renderer skipped (layer still loaded): {e}")
+
+        # Detection mask (only present when a threshold was requested).
+        mask_path = os.path.join(out_dir, "sam_mask.tif")
+        if os.path.exists(mask_path):
+            mlayer = self.iface.addRasterLayer(mask_path, "SAM Detection Mask")
+            if mlayer and mlayer.isValid():
+                try:
+                    from qgis.core import QgsPalettedRasterRenderer
+                    from qgis.PyQt.QtGui import QColor
+                    classes = [
+                        QgsPalettedRasterRenderer.Class(0, QColor(0, 0, 0, 0), "No match"),
+                        QgsPalettedRasterRenderer.Class(1, QColor(255, 0, 0), "Detected"),
+                    ]
+                    mlayer.setRenderer(QgsPalettedRasterRenderer(mlayer.dataProvider(), 1, classes))
+                    mlayer.triggerRepaint()
+                    self.hpc_log.emit("Loaded SAM detection mask (sam_mask.tif).")
+                except Exception as e:
+                    self.hpc_log.emit(f"SAM mask renderer skipped (layer still loaded): {e}")
+
+        # Optional per-pixel cosine similarity band.
+        sim_path = os.path.join(out_dir, "sam_similarity.tif")
+        if os.path.exists(sim_path):
+            slayer = self.iface.addRasterLayer(sim_path, "SAM Similarity")
+            if slayer and slayer.isValid():
+                self.hpc_log.emit("Loaded SAM similarity band (sam_similarity.tif).")
+
+    def _band_min_max(self, provider, band):
+        """~2nd/98th percentile stretch bounds, falling back to full band stats."""
+        try:
+            cut = provider.cumulativeCut(band, 0.02, 0.98)
+            mn, mx = cut[0], cut[1]
+            if mn is not None and mx is not None and mx > mn:
+                return mn, mx
+        except Exception:
+            pass
+        stats = provider.bandStatistics(band)
+        return stats.minimumValue, stats.maximumValue
+
+    def _apply_sam_angle_renderer(self, layer):
+        """Singleband pseudocolor with an INVERTED ramp: small angle = hot match."""
+        from qgis.core import (QgsSingleBandPseudoColorRenderer, QgsRasterShader,
+                               QgsColorRampShader)
+        from qgis.PyQt.QtGui import QColor
+        provider = layer.dataProvider()
+        stats = provider.bandStatistics(1)
+        # nodata is -1.0; clamp the visible minimum to a real angle (>= 0).
+        mn = max(0.0, stats.minimumValue if stats.minimumValue is not None else 0.0)
+        data_max = stats.maximumValue if stats.maximumValue is not None else 1.0
+        # Clamp the ramp max to the chosen threshold if the user set one.
+        mx = self._sam_threshold if self._sam_threshold else data_max
+        if not (mx and mx > mn):
+            mx = data_max if data_max and data_max > mn else mn + 1.0
+        mid = mn + (mx - mn) * 0.5
+
+        shader = QgsRasterShader()
+        ramp = QgsColorRampShader()
+        ramp.setColorRampType(QgsColorRampShader.Interpolated)
+        # Inverted: strongest match (smallest angle) is hot, large angle is cool.
+        items = [
+            QgsColorRampShader.ColorRampItem(mn, QColor(215, 25, 28), f"{mn:.3f} (strong)"),
+            QgsColorRampShader.ColorRampItem(mid, QColor(255, 255, 191), f"{mid:.3f}"),
+            QgsColorRampShader.ColorRampItem(mx, QColor(44, 123, 182), f"{mx:.3f} (weak)"),
+        ]
+        ramp.setColorRampItemList(items)
+        shader.setRasterShaderFunction(ramp)
+        renderer = QgsSingleBandPseudoColorRenderer(provider, 1, shader)
+        if hasattr(renderer, "setClassificationMin"):
+            renderer.setClassificationMin(mn)
+            renderer.setClassificationMax(mx)
+        layer.setRenderer(renderer)

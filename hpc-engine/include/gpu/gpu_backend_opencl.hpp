@@ -30,5 +30,45 @@ bool compute_index_opencl(const RasterChunk& chunk, float* out_index, int index_
 // The exact wrapper function that main.cpp expects
 bool compute_spectral_features_gpu(const HyperspectralTile& tile, const BandConfig& config, SpectralFeatureSet& sf);
 
+// ---------------------------------------------------------------------------
+// Whole-scene GPU operations (SAM, PCA). Each initialises its extra kernels
+// lazily on first use (reusing the context/queue created by init_opencl) and
+// returns false on ANY failure so the caller runs the documented CPU fallback
+// for that tile. All kernels are single-precision float so they build on GPUs
+// without cl_khr_fp64 (e.g. Apple Silicon); float64 accumulation happens on the
+// host.
+// ---------------------------------------------------------------------------
+
+// SAM: one work-item per pixel, single pass. The tile's bands are uploaded as
+// ONE packed band-major buffer (band b of pixel i at b*n + i), the reference in
+// __constant memory, and ||ref|| as a scalar. Mirrors sam::computeTileCPU.
+//   outAngle/outSim : resized to n; radians / cosine-similarity[0,1]; -1 nodata.
+bool compute_sam_gpu(const HyperspectralTile& tile,
+                     const std::vector<float>& ref, float refNorm,
+                     std::vector<float>& outAngle, std::vector<float>& outSim);
+
+// PCA covariance partial for ONE tile (map step). The kernel computes, for every
+// (j,k) entry, Σ_valid (x_j-μ_j)(x_k-μ_k) over the tile's valid pixels using
+// Kahan-compensated float accumulation; the Bk×Bk float partial is summed into
+// the caller's double accumulator (host reduce step). keptBands are 1-based.
+//   covPartialOut : resized to Bk*Bk (row-major), this tile's contribution.
+bool compute_pca_cov_gpu(const HyperspectralTile& tile,
+                         const std::vector<int>& keptBands,
+                         const std::vector<float>& mean,
+                         const std::vector<unsigned char>& valid,
+                         std::vector<double>& covPartialOut);
+
+// PCA projection for ONE tile: y_c = Σ_b Vk[b,c] * (x_b - μ_b) * invStd_b, one
+// work-item per pixel. Vk is Bk×k column-major (Vk[c*Bk + b]). Nodata pixels get
+// `nodataVal`. outComponents is resized to k vectors of n.
+bool compute_pca_project_gpu(const HyperspectralTile& tile,
+                             const std::vector<int>& keptBands,
+                             const std::vector<float>& mean,
+                             const std::vector<float>& invStd,
+                             const std::vector<float>& Vk, int k,
+                             const std::vector<unsigned char>& valid,
+                             float nodataVal,
+                             std::vector<std::vector<float>>& outComponents);
+
 } // namespace gpu
 } // namespace hsi

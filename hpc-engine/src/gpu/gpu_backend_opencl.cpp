@@ -107,7 +107,19 @@ static cl_context g_ctx = nullptr;
 static cl_command_queue g_queue = nullptr;
 static cl_program g_prog = nullptr;
 static cl_kernel g_kernel = nullptr;
+static cl_device_id g_device = nullptr;
 static size_t g_local_size = 256;
+
+// Lazily-built second program holding the whole-scene op kernels (SAM, PCA).
+// Kept separate from the indices program so a build failure here can never
+// disable the (already working) indices GPU path — it only forces the CPU
+// fallback for SAM/PCA.
+static cl_program g_ops_prog     = nullptr;
+static cl_kernel  g_k_sam        = nullptr;
+static cl_kernel  g_k_pca_cov    = nullptr;
+static cl_kernel  g_k_pca_proj   = nullptr;
+static bool       g_ops_ready    = false;
+static bool       g_ops_tried    = false;
 
 bool init_opencl() {
     if (g_ctx) return true;
@@ -138,6 +150,8 @@ bool init_opencl() {
     }
 
     if (!device) return false;
+
+    g_device = device;
 
     char name[256] = {0};
     clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(name), name, nullptr);
@@ -182,10 +196,17 @@ bool init_opencl() {
 }
 
 void teardown_opencl() {
+    if (g_k_sam)      { clReleaseKernel(g_k_sam);      g_k_sam = nullptr; }
+    if (g_k_pca_cov)  { clReleaseKernel(g_k_pca_cov);  g_k_pca_cov = nullptr; }
+    if (g_k_pca_proj) { clReleaseKernel(g_k_pca_proj); g_k_pca_proj = nullptr; }
+    if (g_ops_prog)   { clReleaseProgram(g_ops_prog);  g_ops_prog = nullptr; }
+    g_ops_ready = false;
+    g_ops_tried = false;
     if (g_kernel) { clReleaseKernel(g_kernel); g_kernel = nullptr; }
     if (g_prog)   { clReleaseProgram(g_prog); g_prog = nullptr; }
     if (g_queue)  { clReleaseCommandQueue(g_queue); g_queue = nullptr; }
     if (g_ctx)    { clReleaseContext(g_ctx); g_ctx = nullptr; }
+    g_device = nullptr;
 }
 
 // Serialises GPU dispatch. The kernel and command queue are process-global
@@ -318,6 +339,315 @@ bool compute_spectral_features_gpu(const HyperspectralTile& tile, const BandConf
     
     sf.computed = ok;
     return ok;
+}
+
+// ===========================================================================
+// Whole-scene op kernels (SAM, PCA). Single-precision float throughout so they
+// build on GPUs without cl_khr_fp64; float64 reductions happen on the host.
+// ===========================================================================
+static const char* OPS_KERNEL_SRC = R"CLC(
+// --- SAM: one work-item per pixel ---------------------------------------
+__kernel void sam_angle(__global const float* data,   // B*n band-major
+                        __constant float*     ref,     // B
+                        int n, int B, float refNorm,
+                        __global float* outAngle,
+                        __global float* outSim)
+{
+    const int i = get_global_id(0);
+    if (i >= n) return;
+    float dot = 0.0f, nt = 0.0f;
+    for (int b = 0; b < B; ++b) {
+        const float t  = data[(long)b * n + i];
+        const float rv = ref[b];
+        dot += t * rv;
+        nt  += t * t;
+    }
+    if (nt <= 0.0f || refNorm <= 0.0f) { outAngle[i] = -1.0f; outSim[i] = -1.0f; return; }
+    float cosv = dot / (sqrt(nt) * refNorm);
+    cosv = fmax(-1.0f, fmin(1.0f, cosv));   // clamp BEFORE acos (fast-math safe)
+    outAngle[i] = acos(cosv);
+    outSim[i]   = cosv < 0.0f ? 0.0f : cosv;
+}
+
+// --- PCA covariance partial: one work-item per (j,k) matrix entry --------
+__kernel void pca_cov(__global const float* data,   // Bk*n band-major
+                      __constant float*     mean,    // Bk
+                      __global const uchar* valid,   // n (1=valid, 0=nodata)
+                      int n, int Bk,
+                      __global float* cov)           // Bk*Bk row-major partial
+{
+    const int id = get_global_id(0);
+    if (id >= Bk * Bk) return;
+    const int j = id / Bk;
+    const int k = id % Bk;
+    const float mj = mean[j];
+    const float mk = mean[k];
+    float sum = 0.0f, comp = 0.0f;            // Kahan-compensated float sum
+    const long baseJ = (long)j * n;
+    const long baseK = (long)k * n;
+    for (int i = 0; i < n; ++i) {
+        if (valid[i] == 0) continue;
+        const float prod = (data[baseJ + i] - mj) * (data[baseK + i] - mk);
+        const float y = prod - comp;
+        const float t = sum + y;
+        comp = (t - sum) - y;
+        sum = t;
+    }
+    cov[id] = sum;
+}
+
+// --- PCA projection: one work-item per pixel -----------------------------
+__kernel void pca_project(__global const float* data,  // Bk*n band-major
+                          __constant float*     mean,   // Bk
+                          __constant float*     invStd, // Bk (1.0 for covariance)
+                          __global const float* Vk,      // Bk*k column-major
+                          __global const uchar* valid,   // n
+                          int n, int Bk, int k, float nodataVal,
+                          __global float* out)           // k*n band-major
+{
+    const int i = get_global_id(0);
+    if (i >= n) return;
+    if (valid[i] == 0) {
+        for (int c = 0; c < k; ++c) out[(long)c * n + i] = nodataVal;
+        return;
+    }
+    for (int c = 0; c < k; ++c) {
+        float acc = 0.0f;
+        const long vbase = (long)c * Bk;
+        for (int b = 0; b < Bk; ++b)
+            acc += Vk[vbase + b] * ((data[(long)b * n + i] - mean[b]) * invStd[b]);
+        out[(long)c * n + i] = acc;
+    }
+}
+)CLC";
+
+// Build the ops program once (lazy). Returns false (and leaves CPU fallback in
+// charge) if the context is absent or the program/kernels cannot be built.
+static bool ensure_ops_kernels() {
+    std::lock_guard<std::mutex> lock(g_dispatch_mutex);
+    if (g_ops_ready) return true;
+    if (g_ops_tried) return false;      // already failed once; don't re-spam
+    g_ops_tried = true;
+    if (!g_ctx || !g_device) return false;
+    try {
+        cl_int err;
+        g_ops_prog = clCreateProgramWithSource(g_ctx, 1, &OPS_KERNEL_SRC, nullptr, &err);
+        HSI_CL_CHECK(err);
+        err = clBuildProgram(g_ops_prog, 1, &g_device, "-cl-fast-relaxed-math", nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            size_t log_size = 0;
+            clGetProgramBuildInfo(g_ops_prog, g_device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
+            std::string log(log_size, '\0');
+            if (log_size > 0)
+                clGetProgramBuildInfo(g_ops_prog, g_device, CL_PROGRAM_BUILD_LOG, log_size, &log[0], nullptr);
+            std::cerr << "[opencl] ops build log:\n" << log << "\n";
+            return false;
+        }
+        g_k_sam      = clCreateKernel(g_ops_prog, "sam_angle",   &err); HSI_CL_CHECK(err);
+        g_k_pca_cov  = clCreateKernel(g_ops_prog, "pca_cov",     &err); HSI_CL_CHECK(err);
+        g_k_pca_proj = clCreateKernel(g_ops_prog, "pca_project", &err); HSI_CL_CHECK(err);
+        g_ops_ready = true;
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[opencl] ops kernels unavailable, using CPU: " << e.what() << "\n";
+        return false;
+    }
+}
+
+// Upload the kept bands of a tile as one packed band-major device buffer:
+// packed[row*n + i] = tile.bands[keptBands[row]-1].values[i]. One write per
+// band (no host-side packed copy). Caller holds g_dispatch_mutex.
+static ClMem upload_band_major(const HyperspectralTile& tile,
+                               const std::vector<int>& keptBands,
+                               size_t n, cl_int& err) {
+    const size_t rows  = keptBands.size();
+    const size_t bytes = rows * n * sizeof(float);
+    cl_mem raw = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY, bytes, nullptr, &err);
+    HSI_CL_CHECK(err);
+    ClMem buf(raw);
+    for (size_t row = 0; row < rows; ++row) {
+        const int b0 = keptBands[row] - 1;    // 1-based -> 0-based position
+        HSI_CL_CHECK(clEnqueueWriteBuffer(g_queue, raw, CL_TRUE,
+            row * n * sizeof(float), n * sizeof(float),
+            tile.bands[b0].values.data(), 0, nullptr, nullptr));
+    }
+    HSI_CL_CHECK(clFinish(g_queue));
+    return buf;
+}
+
+bool compute_sam_gpu(const HyperspectralTile& tile,
+                     const std::vector<float>& ref, float refNorm,
+                     std::vector<float>& outAngle, std::vector<float>& outSim) {
+    if (!g_ctx || tile.bands.empty()) return false;
+    if (!ensure_ops_kernels()) return false;
+
+    const int    B = static_cast<int>(tile.bands.size());
+    if (static_cast<int>(ref.size()) != B) return false;
+    const size_t n = tile.bands[0].values.size();
+    if (n == 0) { outAngle.clear(); outSim.clear(); return true; }
+
+    outAngle.assign(n, -1.0f);
+    outSim.assign(n, -1.0f);
+
+    std::lock_guard<std::mutex> lock(g_dispatch_mutex);
+    try {
+        cl_int err;
+        std::vector<int> allBands(B);
+        for (int b = 0; b < B; ++b) allBands[b] = b + 1;
+        ClMem buf_data = upload_band_major(tile, allBands, n, err);
+
+        cl_mem ref_raw = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                        B * sizeof(float), (void*)ref.data(), &err);
+        HSI_CL_CHECK(err); ClMem buf_ref(ref_raw);
+
+        const size_t bytes = n * sizeof(float);
+        cl_mem a_raw = clCreateBuffer(g_ctx, CL_MEM_WRITE_ONLY, bytes, nullptr, &err);
+        HSI_CL_CHECK(err); ClMem buf_angle(a_raw);
+        cl_mem s_raw = clCreateBuffer(g_ctx, CL_MEM_WRITE_ONLY, bytes, nullptr, &err);
+        HSI_CL_CHECK(err); ClMem buf_sim(s_raw);
+
+        cl_mem d = buf_data, r = buf_ref, oa = buf_angle, os = buf_sim;
+        int n_int = static_cast<int>(n), arg = 0;
+        HSI_CL_CHECK(clSetKernelArg(g_k_sam, arg++, sizeof(cl_mem), &d));
+        HSI_CL_CHECK(clSetKernelArg(g_k_sam, arg++, sizeof(cl_mem), &r));
+        HSI_CL_CHECK(clSetKernelArg(g_k_sam, arg++, sizeof(cl_int), &n_int));
+        HSI_CL_CHECK(clSetKernelArg(g_k_sam, arg++, sizeof(cl_int), &B));
+        HSI_CL_CHECK(clSetKernelArg(g_k_sam, arg++, sizeof(cl_float), &refNorm));
+        HSI_CL_CHECK(clSetKernelArg(g_k_sam, arg++, sizeof(cl_mem), &oa));
+        HSI_CL_CHECK(clSetKernelArg(g_k_sam, arg++, sizeof(cl_mem), &os));
+
+        const size_t global = ((n + g_local_size - 1) / g_local_size) * g_local_size;
+        HSI_CL_CHECK(clEnqueueNDRangeKernel(g_queue, g_k_sam, 1, nullptr, &global, &g_local_size, 0, nullptr, nullptr));
+        HSI_CL_CHECK(clEnqueueReadBuffer(g_queue, oa, CL_TRUE, 0, bytes, outAngle.data(), 0, nullptr, nullptr));
+        HSI_CL_CHECK(clEnqueueReadBuffer(g_queue, os, CL_TRUE, 0, bytes, outSim.data(), 0, nullptr, nullptr));
+        HSI_CL_CHECK(clFinish(g_queue));
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[opencl] SAM dispatch failed, using CPU for this tile: " << e.what() << "\n";
+        return false;
+    }
+}
+
+bool compute_pca_cov_gpu(const HyperspectralTile& tile,
+                         const std::vector<int>& keptBands,
+                         const std::vector<float>& mean,
+                         const std::vector<unsigned char>& valid,
+                         std::vector<double>& covPartialOut) {
+    if (!g_ctx || tile.bands.empty()) return false;
+    if (!ensure_ops_kernels()) return false;
+
+    const int    Bk = static_cast<int>(keptBands.size());
+    const size_t n  = tile.bands[0].values.size();
+    covPartialOut.assign(static_cast<size_t>(Bk) * Bk, 0.0);
+    if (n == 0 || Bk == 0) return true;
+
+    std::lock_guard<std::mutex> lock(g_dispatch_mutex);
+    try {
+        cl_int err;
+        ClMem buf_data = upload_band_major(tile, keptBands, n, err);
+
+        cl_mem m_raw = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                      Bk * sizeof(float), (void*)mean.data(), &err);
+        HSI_CL_CHECK(err); ClMem buf_mean(m_raw);
+
+        cl_mem v_raw = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                      n * sizeof(unsigned char), (void*)valid.data(), &err);
+        HSI_CL_CHECK(err); ClMem buf_valid(v_raw);
+
+        const size_t covBytes = static_cast<size_t>(Bk) * Bk * sizeof(float);
+        cl_mem c_raw = clCreateBuffer(g_ctx, CL_MEM_WRITE_ONLY, covBytes, nullptr, &err);
+        HSI_CL_CHECK(err); ClMem buf_cov(c_raw);
+
+        cl_mem d = buf_data, m = buf_mean, v = buf_valid, c = buf_cov;
+        int n_int = static_cast<int>(n), arg = 0;
+        HSI_CL_CHECK(clSetKernelArg(g_k_pca_cov, arg++, sizeof(cl_mem), &d));
+        HSI_CL_CHECK(clSetKernelArg(g_k_pca_cov, arg++, sizeof(cl_mem), &m));
+        HSI_CL_CHECK(clSetKernelArg(g_k_pca_cov, arg++, sizeof(cl_mem), &v));
+        HSI_CL_CHECK(clSetKernelArg(g_k_pca_cov, arg++, sizeof(cl_int), &n_int));
+        HSI_CL_CHECK(clSetKernelArg(g_k_pca_cov, arg++, sizeof(cl_int), &Bk));
+        HSI_CL_CHECK(clSetKernelArg(g_k_pca_cov, arg++, sizeof(cl_mem), &c));
+
+        const size_t entries = static_cast<size_t>(Bk) * Bk;
+        const size_t global  = ((entries + g_local_size - 1) / g_local_size) * g_local_size;
+        HSI_CL_CHECK(clEnqueueNDRangeKernel(g_queue, g_k_pca_cov, 1, nullptr, &global, &g_local_size, 0, nullptr, nullptr));
+
+        std::vector<float> covF(entries);
+        HSI_CL_CHECK(clEnqueueReadBuffer(g_queue, c, CL_TRUE, 0, covBytes, covF.data(), 0, nullptr, nullptr));
+        HSI_CL_CHECK(clFinish(g_queue));
+        for (size_t i = 0; i < entries; ++i) covPartialOut[i] = static_cast<double>(covF[i]);
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[opencl] PCA cov dispatch failed, using CPU for this tile: " << e.what() << "\n";
+        return false;
+    }
+}
+
+bool compute_pca_project_gpu(const HyperspectralTile& tile,
+                             const std::vector<int>& keptBands,
+                             const std::vector<float>& mean,
+                             const std::vector<float>& invStd,
+                             const std::vector<float>& Vk, int k,
+                             const std::vector<unsigned char>& valid,
+                             float nodataVal,
+                             std::vector<std::vector<float>>& outComponents) {
+    if (!g_ctx || tile.bands.empty()) return false;
+    if (!ensure_ops_kernels()) return false;
+
+    const int    Bk = static_cast<int>(keptBands.size());
+    const size_t n  = tile.bands[0].values.size();
+    outComponents.assign(k, std::vector<float>(n, nodataVal));
+    if (n == 0 || Bk == 0 || k == 0) return true;
+
+    std::lock_guard<std::mutex> lock(g_dispatch_mutex);
+    try {
+        cl_int err;
+        ClMem buf_data = upload_band_major(tile, keptBands, n, err);
+
+        cl_mem m_raw = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                      Bk * sizeof(float), (void*)mean.data(), &err);
+        HSI_CL_CHECK(err); ClMem buf_mean(m_raw);
+        cl_mem is_raw = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                       Bk * sizeof(float), (void*)invStd.data(), &err);
+        HSI_CL_CHECK(err); ClMem buf_istd(is_raw);
+        cl_mem vk_raw = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                       Vk.size() * sizeof(float), (void*)Vk.data(), &err);
+        HSI_CL_CHECK(err); ClMem buf_vk(vk_raw);
+        cl_mem v_raw = clCreateBuffer(g_ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                      n * sizeof(unsigned char), (void*)valid.data(), &err);
+        HSI_CL_CHECK(err); ClMem buf_valid(v_raw);
+
+        const size_t outBytes = static_cast<size_t>(k) * n * sizeof(float);
+        cl_mem o_raw = clCreateBuffer(g_ctx, CL_MEM_WRITE_ONLY, outBytes, nullptr, &err);
+        HSI_CL_CHECK(err); ClMem buf_out(o_raw);
+
+        cl_mem d = buf_data, m = buf_mean, is = buf_istd, vk = buf_vk, v = buf_valid, o = buf_out;
+        int n_int = static_cast<int>(n), arg = 0;
+        HSI_CL_CHECK(clSetKernelArg(g_k_pca_proj, arg++, sizeof(cl_mem), &d));
+        HSI_CL_CHECK(clSetKernelArg(g_k_pca_proj, arg++, sizeof(cl_mem), &m));
+        HSI_CL_CHECK(clSetKernelArg(g_k_pca_proj, arg++, sizeof(cl_mem), &is));
+        HSI_CL_CHECK(clSetKernelArg(g_k_pca_proj, arg++, sizeof(cl_mem), &vk));
+        HSI_CL_CHECK(clSetKernelArg(g_k_pca_proj, arg++, sizeof(cl_mem), &v));
+        HSI_CL_CHECK(clSetKernelArg(g_k_pca_proj, arg++, sizeof(cl_int), &n_int));
+        HSI_CL_CHECK(clSetKernelArg(g_k_pca_proj, arg++, sizeof(cl_int), &Bk));
+        HSI_CL_CHECK(clSetKernelArg(g_k_pca_proj, arg++, sizeof(cl_int), &k));
+        HSI_CL_CHECK(clSetKernelArg(g_k_pca_proj, arg++, sizeof(cl_float), &nodataVal));
+        HSI_CL_CHECK(clSetKernelArg(g_k_pca_proj, arg++, sizeof(cl_mem), &o));
+
+        const size_t global = ((n + g_local_size - 1) / g_local_size) * g_local_size;
+        HSI_CL_CHECK(clEnqueueNDRangeKernel(g_queue, g_k_pca_proj, 1, nullptr, &global, &g_local_size, 0, nullptr, nullptr));
+
+        std::vector<float> flat(static_cast<size_t>(k) * n);
+        HSI_CL_CHECK(clEnqueueReadBuffer(g_queue, o, CL_TRUE, 0, outBytes, flat.data(), 0, nullptr, nullptr));
+        HSI_CL_CHECK(clFinish(g_queue));
+        for (int c = 0; c < k; ++c)
+            std::copy(flat.begin() + static_cast<size_t>(c) * n,
+                      flat.begin() + static_cast<size_t>(c + 1) * n,
+                      outComponents[c].begin());
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[opencl] PCA projection dispatch failed, using CPU for this tile: " << e.what() << "\n";
+        return false;
+    }
 }
 
 } // namespace gpu

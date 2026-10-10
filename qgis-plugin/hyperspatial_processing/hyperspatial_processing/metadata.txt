@@ -3,13 +3,17 @@
 name=HyperSpectral Processer
 qgisMinimumVersion=3.0
 qgisMaximumVersion=4.99
-description=Local hyperspectral processing: generates spectral-index GeoTIFFs (NDVI, NDWI, NDBI, SAVI, EVI, NDMI, MSAVI) from hyperspectral rasters via a C++/OpenMP/OpenCL engine.
-version=0.1
+description=Local, GPU-accelerated hyperspectral processing in QGIS: spectral indices, PCA, and Spectral Angle Mapper target detection via an external C++/OpenMP/OpenCL engine.
+version=0.2
 author=Aaron R
 email=aaronr43210@gmail.com
-about=Single-purpose, local-first QGIS plugin from Digital University Kerala for hyperspectral image processing. It drives an external C++/OpenMP/OpenCL engine to compute spectral indices (NDVI, NDWI, NDBI, SAVI, EVI, NDMI, MSAVI) from hyperspectral rasters, writes them as GeoTIFF or VRT layers, and loads the results straight into the QGIS canvas. All per-pixel math runs in the native engine to keep large scenes off the Python heap. The plugin ships binary-free: the engine is located at run time from a configured path, the system PATH, or built from the bundled hpc-engine source.
+about=Single-purpose, local-first QGIS plugin from Digital University Kerala for hyperspectral image processing. It drives an external C++/OpenMP/OpenCL engine to process hyperspectral rasters entirely on local hardware, writing results as GeoTIFF or VRT layers and loading them straight into the QGIS canvas. All per-pixel math runs in the native engine to keep large scenes off the Python heap. The plugin ships binary-free: the engine is located at run time from a configured path, the system PATH, or built from the bundled hpc-engine source.
+ .
+ Three operations are selectable from one uncluttered dialog: (1) Spectral indices - NDVI, NDWI, NDBI, SAVI, EVI, NDMI and MSAVI; (2) PCA - principal-component dimensionality reduction producing false-colour PC composites (covariance or correlation matrix); (3) SAM - Spectral Angle Mapper reflectance-based target detection from a reference pixel picked on the map, with an optional detection mask and similarity band. Compute runs on the GPU through OpenCL where available, with automatic multi-core CPU fallback that produces identical results.
 category=Raster
 experimental=True
 tracker=https://github.com/aaron43210/HYPERSPECTRAL-DISTRIBUTED-HPC/issues
 repository=https://github.com/aaron43210/HYPERSPECTRAL-DISTRIBUTED-HPC
 homepage=https://github.com/aaron43210/HYPERSPECTRAL-DISTRIBUTED-HPC
+changelog=0.2 Added an Operation selector with two new operations alongside spectral indices: PCA (false-colour PC composites) and Spectral Angle Mapper (SAM) target detection from a picked reference pixel, with optional detection mask and similarity band.
+ 0.1 Initial release: spectral indices (NDVI, NDWI, NDBI, SAVI, EVI, NDMI, MSAVI).

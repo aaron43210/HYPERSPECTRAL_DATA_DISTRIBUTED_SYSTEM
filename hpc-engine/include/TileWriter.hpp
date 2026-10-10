@@ -6,6 +6,7 @@
 #include "RasterReader.hpp"
 #include "SpectralFeatures.hpp"
 #include <string>
+#include <vector>
 #include <mutex>
 
 /// Result of writing a tile's GeoTIFF, needed to describe it in summary.csv.
@@ -45,4 +46,41 @@ public:
                                   const std::string& csvPath,
                                   int rowStart, int colStart,
                                   std::mutex& csvMutex);
+};
+
+// -----------------------------------------------------------------------------
+// SceneRaster  —  a single scene-sized GeoTIFF written window-by-window
+//
+// Whole-scene operations (SAM, PCA) produce one output raster covering the
+// entire scene, but the engine still processes it tile-by-tile (never holding
+// the cube). SceneRaster owns one LZW+TILED GeoTIFF and lets each worker write
+// its tile's window; an internal mutex serialises the RasterIO writes because a
+// shared GDALDataset handle is not thread-safe. Band descriptions, geotransform,
+// CRS and a nodata value are set once at construction.
+// -----------------------------------------------------------------------------
+class SceneRaster {
+public:
+    enum class Type { Float32, Byte };
+
+    SceneRaster(const std::string& path, int cols, int rows, int nbands,
+                Type type, const double* geoTransform, const std::string& wkt,
+                double nodata, const std::vector<std::string>& bandDescriptions);
+    ~SceneRaster();
+
+    SceneRaster(const SceneRaster&)            = delete;
+    SceneRaster& operator=(const SceneRaster&) = delete;
+
+    /// Write a float32 window into 0-based band `band0`. `data` is w*h row-major.
+    void writeWindow(int band0, int colStart, int rowStart, int w, int h,
+                     const float* data);
+    /// Write a Byte window into 0-based band `band0`. `data` is w*h row-major.
+    void writeWindow(int band0, int colStart, int rowStart, int w, int h,
+                     const unsigned char* data);
+
+    /// Flush and close the dataset (also called by the destructor).
+    void finalize();
+
+private:
+    GDALDataset* ds_ = nullptr;
+    std::mutex   mtx_;
 };
