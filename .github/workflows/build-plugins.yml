@@ -3,13 +3,28 @@ name: Build Plugin (Windows / Linux / macOS)
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
   workflow_dispatch:
+
+# Needed so action-gh-release can create/update the Release and upload assets.
+permissions:
+  contents: write
 
 jobs:
   windows:
     runs-on: windows-latest
+    env:
+      # Route vcpkg binary packages through the GitHub Actions cache so GDAL
+      # is downloaded (not recompiled from source) on a warm cache.
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
     steps:
       - uses: actions/checkout@v4
+      - name: Export GitHub Actions cache env (for vcpkg x-gha backend)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
       - name: Install GDAL + OpenCL (vcpkg, x64)
         run: vcpkg install opencl:x64-windows gdal:x64-windows
       - name: Build C++ engine (Release, x64)
@@ -26,6 +41,16 @@ jobs:
           New-Item -ItemType Directory -Force -Path $bin | Out-Null
           Copy-Item hpc-engine/build/Release/hyperspatial_cli.exe -Destination $bin/
           Copy-Item C:/vcpkg/installed/x64-windows/bin/*.dll -Destination $bin/ -ErrorAction SilentlyContinue
+      - name: Create engine-only zip (root = contents of bin/windows)
+        shell: pwsh
+        run: |
+          $bin = "qgis-plugin/hyperspatial_processing/hyperspatial_processing/bin/windows"
+          Compress-Archive -Path "$bin/*" -DestinationPath engine-windows-x64.zip -Force
+      - name: Attach engine zip to Release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: engine-windows-x64.zip
       - name: Package zip
         shell: pwsh
         run: Compress-Archive -Path qgis-plugin/hyperspatial_processing/hyperspatial_processing -DestinationPath hyperspatial_processing_windows.zip -Force
@@ -62,6 +87,15 @@ jobs:
           done
           codesign --force -s - "$BIN"/*.dylib
           codesign --force -s - "$BIN/hyperspatial_cli"
+      - name: Create engine-only zip (root = contents of bin/macos)
+        run: |
+          cd qgis-plugin/hyperspatial_processing/hyperspatial_processing/bin/macos
+          zip -r "$GITHUB_WORKSPACE/engine-macos-arm64.zip" .
+      - name: Attach engine zip to Release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: engine-macos-arm64.zip
       - name: Package zip (root = plugin package folder)
         run: |
           cd qgis-plugin/hyperspatial_processing
@@ -96,6 +130,15 @@ jobs:
           done
           patchelf --set-rpath '$ORIGIN/libs' "$BIN/hyperspatial_cli"
           for f in "$BIN"/libs/*.so*; do patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true; done
+      - name: Create engine-only zip (root = contents of bin/linux)
+        run: |
+          cd qgis-plugin/hyperspatial_processing/hyperspatial_processing/bin/linux
+          zip -r "$GITHUB_WORKSPACE/engine-linux-x64.zip" .
+      - name: Attach engine zip to Release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: engine-linux-x64.zip
       - name: Package zip (root = plugin package folder)
         run: |
           cd qgis-plugin/hyperspatial_processing

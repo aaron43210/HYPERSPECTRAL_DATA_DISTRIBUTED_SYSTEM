@@ -19,14 +19,18 @@ _N_INDEX_BANDS = 7
 
 import os
 import sys
+import ssl
 import glob
 import stat
 import math
+import zipfile
 import contextlib
 import tempfile
 import subprocess  # nosec B404 - runs the external HPC engine with a fixed argv, no shell
 import threading
 import multiprocessing
+import urllib.error
+import urllib.request
 
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
@@ -36,7 +40,46 @@ from qgis.PyQt.QtWidgets import (
 from qgis.PyQt.QtCore import pyqtSignal, QSettings
 from osgeo import gdal
 
-from .engine_locator import resolve_engine, engine_env, ENGINE_SETTINGS_KEY
+from .engine_locator import (
+    resolve_engine, engine_env, ENGINE_SETTINGS_KEY, _platform_exe,
+)
+
+# Prebuilt engine releases live on GitHub Releases; "Download engine" fetches the
+# asset matching the host platform so a store-installed (binary-free) plugin can
+# obtain a working engine in one click.
+_ENGINE_RELEASE_BASE = (
+    "https://github.com/aaron43210/HYPERSPECTRAL_DATA_DISTRIBUTED_SYSTEM"
+    "/releases/latest/download"
+)
+
+
+def _engine_asset_for_host():
+    """Return ``(os_name, arch, asset_name, url)`` for the running host.
+
+    Mapping: darwin -> macos/arm64, win32 -> windows/x64, else linux/x64.
+    """
+    host = sys.platform
+    if host == 'darwin':
+        os_name, arch = 'macos', 'arm64'
+    elif host.startswith('win'):
+        os_name, arch = 'windows', 'x64'
+    else:
+        os_name, arch = 'linux', 'x64'
+    asset = f"engine-{os_name}-{arch}.zip"
+    return os_name, arch, asset, f"{_ENGINE_RELEASE_BASE}/{asset}"
+
+
+def _make_ssl_context():
+    """Verified TLS context: prefer certifi's CA bundle, else the system default.
+
+    Mirrors services/enmap_client.py: macOS Python builds often ship no root CA
+    bundle, so certifi is preferred; either way certificate verification stays ON.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 
 class HyperspectralProcessingDialog(QDialog):
@@ -45,6 +88,9 @@ class HyperspectralProcessingDialog(QDialog):
     # Thread-safe channels from the worker thread back to the GUI thread.
     hpc_log = pyqtSignal(str)
     hpc_finished = pyqtSignal(str)
+    # Engine-download worker -> GUI: carries success flag so the slot re-enables
+    # the Download button and refreshes the engine display on the GUI thread.
+    engine_download_finished = pyqtSignal(bool)
 
     def __init__(self, iface, parent=None):
         super(HyperspectralProcessingDialog, self).__init__(parent)
@@ -66,6 +112,7 @@ class HyperspectralProcessingDialog(QDialog):
 
         self.hpc_log.connect(self.append_hpc_log)
         self.hpc_finished.connect(self.on_hpc_finished)
+        self.engine_download_finished.connect(self.on_engine_download_finished)
 
         self._refresh_engine_display()
 
@@ -105,9 +152,15 @@ class HyperspectralProcessingDialog(QDialog):
         btn_engine.setToolTip("Select the compiled hyperspatial_cli engine binary.\n"
                               "The choice is saved for future sessions.")
         btn_engine.clicked.connect(self._browse_engine)
+        self.btn_engine_download = QPushButton("Download engine")
+        self.btn_engine_download.setToolTip(
+            "Download the prebuilt engine for your platform from GitHub Releases\n"
+            "and install it so this plugin can run without building from source.")
+        self.btn_engine_download.clicked.connect(self._download_engine)
         he.addWidget(QLabel("Engine:"))
         he.addWidget(self.le_engine)
         he.addWidget(btn_engine)
+        he.addWidget(self.btn_engine_download)
         layout.addLayout(he)
 
         # ---- Operation selector + per-operation page stack ------------------
@@ -284,6 +337,138 @@ class HyperspectralProcessingDialog(QDialog):
         if path:
             QSettings().setValue(ENGINE_SETTINGS_KEY, path)
             self._refresh_engine_display()
+
+    # ------------------------------------------------------------ engine download
+    def _download_engine(self):
+        """One-click fetch+install of the prebuilt engine for the host platform.
+
+        Resolves the release asset URL and target bin/<plat> dir on the GUI
+        thread, then streams the download + install on a background thread so the
+        UI never blocks (AGENTS.md). Widgets are only touched here / in the
+        finished slot, never from the worker.
+        """
+        plat, exe = _platform_exe()
+        os_name, arch, asset, url = _engine_asset_for_host()
+        bin_dir = os.path.join(os.path.dirname(__file__), 'bin', plat)
+
+        self.btn_engine_download.setEnabled(False)
+        self.hpc_log.emit(f"Downloading engine for {os_name}/{arch}...")
+        self.hpc_log.emit(f"Asset: {asset}")
+        self.hpc_log.emit(f"URL: {url}")
+        threading.Thread(target=self._download_engine_task,
+                         args=(url, bin_dir, exe, plat),
+                         daemon=True).start()
+
+    def _download_engine_task(self, url, bin_dir, exe, plat):
+        """Worker: download the release zip over verified TLS and install it.
+
+        Streams to a temp file (constant RAM), extracts into bin/<plat>, sets the
+        execute bit, and clears the macOS Gatekeeper quarantine flag. Emits only
+        signals back to the GUI thread; never touches widgets directly.
+        """
+        success = False
+        tmp_path = None
+        try:
+            ctx = _make_ssl_context()
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "hyperspatial-processing-plugin"})
+            with urllib.request.urlopen(req, timeout=300, context=ctx) as resp:  # nosec B310 - fixed https GitHub release URL
+                total = int(resp.headers.get("Content-Length", 0) or 0)
+                fd, tmp_path = tempfile.mkstemp(prefix="hyperspatial_engine_",
+                                                suffix=".zip")
+                downloaded = 0
+                next_report = 10
+                chunk_size = 1 << 20  # 1 MB
+                with os.fdopen(fd, "wb") as f:
+                    while True:
+                        buf = resp.read(chunk_size)
+                        if not buf:
+                            break
+                        f.write(buf)
+                        downloaded += len(buf)
+                        if total:
+                            pct = int(downloaded * 100 / total)
+                            if pct >= next_report:
+                                self.hpc_log.emit(
+                                    f"Downloaded {pct}% "
+                                    f"({downloaded}/{total} bytes)")
+                                next_report = pct - (pct % 10) + 10
+                self.hpc_log.emit(f"Downloaded {downloaded} bytes; extracting...")
+
+            os.makedirs(bin_dir, exist_ok=True)
+            with zipfile.ZipFile(tmp_path) as zf:
+                zf.extractall(bin_dir)  # nosec B202 - trusted first-party release asset
+
+            # Locate the engine binary: expected directly in bin/<plat>, but tolerate
+            # a zip that nests it one or more levels deep.
+            engine_path = os.path.join(bin_dir, exe)
+            if not os.path.isfile(engine_path):
+                engine_path = None
+                for root, _dirs, files in os.walk(bin_dir):
+                    if exe in files:
+                        engine_path = os.path.join(root, exe)
+                        break
+
+            if not engine_path:
+                self.hpc_log.emit(
+                    f"ERROR: extracted archive did not contain '{exe}'. "
+                    "The release asset may be for a different platform.")
+                return
+
+            # Best-effort execute bit (ZIPs drop it on macOS/Linux).
+            with contextlib.suppress(OSError):
+                os.chmod(engine_path, os.stat(engine_path).st_mode | stat.S_IEXEC)
+
+            # macOS Gatekeeper quarantines downloaded binaries; strip the flag so
+            # the engine can launch. Non-fatal if xattr is missing or fails.
+            if sys.platform == 'darwin':
+                try:
+                    subprocess.run(  # nosec B603 B607 - fixed argv, no shell
+                        ["xattr", "-dr", "com.apple.quarantine", bin_dir],
+                        check=False,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception as e:
+                    self.hpc_log.emit(
+                        f"Note: could not clear macOS quarantine flag "
+                        f"(non-fatal): {e}")
+
+            # If the binary landed somewhere resolve_engine() would not look
+            # (nested zip), persist its exact path so RUN still finds it.
+            expected = os.path.join(bin_dir, exe)
+            if os.path.abspath(engine_path) != os.path.abspath(expected):
+                with contextlib.suppress(Exception):
+                    QSettings().setValue(ENGINE_SETTINGS_KEY, engine_path)
+                self.hpc_log.emit(f"Engine installed to {engine_path}")
+            else:
+                self.hpc_log.emit(f"Engine installed to bin/{plat}/")
+            success = True
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                self.hpc_log.emit(
+                    "ERROR: no prebuilt engine release asset for your platform "
+                    "yet (HTTP 404). Build from source or use Browse instead.")
+            else:
+                self.hpc_log.emit(
+                    f"ERROR: download failed with HTTP {e.code}: {e.reason}")
+        except urllib.error.URLError as e:
+            self.hpc_log.emit(f"ERROR: network error during download: {e.reason}")
+        except Exception as e:
+            self.hpc_log.emit(f"ERROR: engine download/install failed: {e}")
+        finally:
+            if tmp_path:
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_path)
+            self.engine_download_finished.emit(success)
+
+    def on_engine_download_finished(self, success):
+        """GUI-thread slot: re-enable the Download button and refresh the engine row."""
+        try:
+            self._refresh_engine_display()
+            if success:
+                self.hpc_log.emit("Engine ready - the RUN button can now use it.")
+        finally:
+            self.btn_engine_download.setEnabled(True)
+
 
     # --------------------------------------------------------------- SAM pick
     def _update_sam_angle_label(self, value):
