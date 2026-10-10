@@ -18,6 +18,7 @@ import os
 import sys
 import platform
 import shutil
+import contextlib
 
 from qgis.PyQt.QtCore import QSettings
 
@@ -64,7 +65,7 @@ def resolve_engine():
         if os.path.isfile(candidate):
             return candidate, 'bundled binary', None
 
-    error = (
+    error = (  # nosec B608 - plain English user-facing message, not an SQL query
         "Hyperspectral C++ engine not found.\n\n"
         "This plugin ships without the compiled engine. To enable processing, do "
         "ONE of the following:\n"
@@ -91,21 +92,17 @@ def engine_env():
         lib_dirs = []
 
         # GDAL directory derived from the Python osgeo package location.
-        try:
+        with contextlib.suppress(Exception):
             from osgeo import gdal
             lib_dirs.append(os.path.dirname(gdal.__file__))
-        except Exception:
-            pass
 
         # QGIS install prefix (its lib/ usually holds the GDAL dylib/so/dll).
-        try:
+        with contextlib.suppress(Exception):
             from qgis.core import QgsApplication
             prefix = QgsApplication.prefixPath()
             if prefix:
                 lib_dirs.append(os.path.join(prefix, 'lib'))
                 lib_dirs.append(prefix)
-        except Exception:
-            pass
 
         lib_dirs = [d for d in lib_dirs if d and os.path.isdir(d)]
         if lib_dirs:

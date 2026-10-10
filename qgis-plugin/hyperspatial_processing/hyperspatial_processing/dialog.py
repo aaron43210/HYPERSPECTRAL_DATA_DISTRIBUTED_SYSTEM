@@ -22,6 +22,7 @@ import sys
 import glob
 import stat
 import math
+import contextlib
 import tempfile
 import subprocess
 import threading
@@ -364,11 +365,9 @@ class HyperspectralProcessingDialog(QDialog):
         except Exception as e:
             self.hpc_log.emit(f"Reference capture failed: {e}")
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 if self._sam_pick_tool is not None:
                     self.iface.mapCanvas().unsetMapTool(self._sam_pick_tool)
-            except Exception:
-                pass
     # ------------------------------------------------------------------ run
     def run_hpc(self):
         layer = self.cb_input.currentLayer()
@@ -478,7 +477,7 @@ class HyperspectralProcessingDialog(QDialog):
                 popen_kw['creationflags'] = subprocess.CREATE_NO_WINDOW
             # env=engine_env(): prepend QGIS's own GDAL dir so the external engine
             # links the exact GDAL that QGIS uses.
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,  # nosec B603 - cmd is the resolved engine path + fixed flags, no shell
                                     text=True, env=engine_env(), **popen_kw)
             for line in iter(proc.stdout.readline, ''):
                 self.hpc_log.emit(line.strip())
@@ -529,10 +528,8 @@ class HyperspectralProcessingDialog(QDialog):
                 if not is_vrt_mode:
                     self.hpc_log.emit("Cleaning up temporary chunk files...")
                     for tile in tiles:
-                        try:
+                        with contextlib.suppress(OSError):
                             os.remove(tile)
-                        except OSError:
-                            pass
         except Exception as e:
             self.hpc_log.emit(f"Process Failed: {e}")
         finally:
@@ -682,13 +679,11 @@ class HyperspectralProcessingDialog(QDialog):
 
     def _band_min_max(self, provider, band):
         """~2nd/98th percentile stretch bounds, falling back to full band stats."""
-        try:
+        with contextlib.suppress(Exception):
             cut = provider.cumulativeCut(band, 0.02, 0.98)
             mn, mx = cut[0], cut[1]
             if mn is not None and mx is not None and mx > mn:
                 return mn, mx
-        except Exception:
-            pass
         stats = provider.bandStatistics(band)
         return stats.minimumValue, stats.maximumValue
 
