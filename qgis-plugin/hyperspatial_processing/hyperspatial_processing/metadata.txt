@@ -12,8 +12,8 @@ about=Single-purpose, local-first QGIS plugin from Digital University Kerala for
  Three operations are selectable from one uncluttered dialog: (1) Spectral indices - NDVI, NDWI, NDBI, SAVI, EVI, NDMI and MSAVI; (2) PCA - principal-component dimensionality reduction producing false-colour PC composites (covariance or correlation matrix); (3) SAM - Spectral Angle Mapper reflectance-based target detection from a reference pixel picked on the map, with an optional detection mask and similarity band. Compute runs on the GPU through OpenCL where available, with automatic multi-core CPU fallback that produces identical results.
 category=Raster
 experimental=True
-tracker=https://github.com/aaron43210/HYPERSPECTRAL-DISTRIBUTED-HPC/issues
-repository=https://github.com/aaron43210/HYPERSPECTRAL-DISTRIBUTED-HPC
-homepage=https://github.com/aaron43210/HYPERSPECTRAL-DISTRIBUTED-HPC
+tracker=https://github.com/aaron43210/HYPERSPECTRAL_DATA_DISTRIBUTED_SYSTEM/issues
+repository=https://github.com/aaron43210/HYPERSPECTRAL_DATA_DISTRIBUTED_SYSTEM
+homepage=https://github.com/aaron43210/HYPERSPECTRAL_DATA_DISTRIBUTED_SYSTEM
 changelog=0.2 Added an Operation selector with two new operations alongside spectral indices: PCA (false-colour PC composites) and Spectral Angle Mapper (SAM) target detection from a picked reference pixel, with optional detection mask and similarity band.
  0.1 Initial release: spectral indices (NDVI, NDWI, NDBI, SAVI, EVI, NDMI, MSAVI).
