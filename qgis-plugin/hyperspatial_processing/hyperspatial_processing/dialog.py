@@ -24,7 +24,7 @@ import stat
 import math
 import contextlib
 import tempfile
-import subprocess
+import subprocess  # nosec B404 - runs the external HPC engine with a fixed argv, no shell
 import threading
 import multiprocessing
 

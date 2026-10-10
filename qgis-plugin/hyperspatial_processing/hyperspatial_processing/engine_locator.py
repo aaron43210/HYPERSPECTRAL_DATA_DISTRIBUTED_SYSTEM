@@ -16,7 +16,6 @@ directory so the external engine links against the exact GDAL QGIS uses.
 """
 import os
 import sys
-import platform
 import shutil
 import contextlib
 
@@ -65,16 +64,14 @@ def resolve_engine():
         if os.path.isfile(candidate):
             return candidate, 'bundled binary', None
 
-    error = (  # nosec B608 - plain English user-facing message, not an SQL query
+    error = (
         "Hyperspectral C++ engine not found.\n\n"
-        "This plugin ships without the compiled engine. To enable processing, do "
-        "ONE of the following:\n"
-        f"  1. Click 'Browse...' on the Engine row and select the '{exe}' binary "
-        "(the choice is remembered).\n"
-        f"  2. Put '{exe}' on your system PATH.\n"
-        "  3. Build it from source: see hpc-engine/ (CMake + GDAL + OpenMP/OpenCL) "
-        f"and install the resulting '{exe}'.\n\n"
-        f"(Host platform: {platform.system()} {platform.machine()}.)"
+        "This plugin ships without the compiled engine. To enable processing, "
+        "do ONE of the following:\n"
+        "  1. Click 'Browse...' on the Engine row and select the hyperspatial_cli "
+        "binary (hyperspatial_cli.exe on Windows); the choice is remembered.\n"
+        "  2. Put that binary on your system PATH.\n"
+        "  3. Build it from source: see hpc-engine/ (CMake + GDAL + OpenMP/OpenCL)."
     )
     return None, None, error
 
