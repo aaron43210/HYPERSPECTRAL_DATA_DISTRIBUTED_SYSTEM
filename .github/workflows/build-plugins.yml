@@ -43,17 +43,25 @@ jobs:
         run: |
           cmake -S hpc-engine -B hpc-engine/build -DUSE_OPENCL=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build hpc-engine/build -j
-      - name: Bundle engine + dylibs (self-contained via @loader_path)
+      - name: Bundle engine + dylibs (self-contained, @loader_path)
         run: |
-          set -x
+          set -e
           BIN=qgis-plugin/hyperspatial_processing/hyperspatial_processing/bin/macos
           mkdir -p "$BIN"
           cp hpc-engine/build/hyperspatial_cli "$BIN/"
-          otool -L "$BIN/hyperspatial_cli" || true
-          # -s gives dylibbundler the Homebrew lib dir so it resolves @rpath deps
-          # without prompting; </dev/null avoids any interactive hang in CI.
-          dylibbundler -of -b -x "$BIN/hyperspatial_cli" -d "$BIN/libs" -p @loader_path/libs \
+          # Bundle every non-system dylib NEXT TO the exe so one uniform prefix
+          # (@loader_path/) is correct for exe->lib AND lib->lib (a libs/ subdir
+          # double-paths inter-lib deps). -cd creates the dir; -s gives Homebrew
+          # search paths; </dev/null keeps it non-interactive.
+          dylibbundler -cd -of -b -x "$BIN/hyperspatial_cli" -d "$BIN" -p @loader_path/ \
             -s /opt/homebrew/lib -s "$(brew --prefix)/lib" </dev/null
+          # Recent dyld rejects dylibs carrying a duplicate LC_RPATH; strip them,
+          # then re-sign ad-hoc (arm64 requires a valid signature after editing).
+          for f in "$BIN/hyperspatial_cli" "$BIN"/*.dylib; do
+            while install_name_tool -delete_rpath '@loader_path/' "$f" 2>/dev/null; do :; done
+          done
+          codesign --force -s - "$BIN"/*.dylib
+          codesign --force -s - "$BIN/hyperspatial_cli"
       - name: Package zip
         run: zip -r hyperspatial_processing_macos.zip qgis-plugin/hyperspatial_processing/hyperspatial_processing
       - uses: actions/upload-artifact@v4
