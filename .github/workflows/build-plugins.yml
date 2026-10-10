@@ -62,8 +62,10 @@ jobs:
           done
           codesign --force -s - "$BIN"/*.dylib
           codesign --force -s - "$BIN/hyperspatial_cli"
-      - name: Package zip
-        run: zip -r hyperspatial_processing_macos.zip qgis-plugin/hyperspatial_processing/hyperspatial_processing
+      - name: Package zip (root = plugin package folder)
+        run: |
+          cd qgis-plugin/hyperspatial_processing
+          zip -r "$GITHUB_WORKSPACE/hyperspatial_processing_macos.zip" hyperspatial_processing
       - uses: actions/upload-artifact@v4
         with:
           name: hyperspatial_processing_macos_plugin
@@ -94,8 +96,10 @@ jobs:
           done
           patchelf --set-rpath '$ORIGIN/libs' "$BIN/hyperspatial_cli"
           for f in "$BIN"/libs/*.so*; do patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true; done
-      - name: Package zip
-        run: zip -r hyperspatial_processing_linux.zip qgis-plugin/hyperspatial_processing/hyperspatial_processing
+      - name: Package zip (root = plugin package folder)
+        run: |
+          cd qgis-plugin/hyperspatial_processing
+          zip -r "$GITHUB_WORKSPACE/hyperspatial_processing_linux.zip" hyperspatial_processing
       - uses: actions/upload-artifact@v4
         with:
           name: hyperspatial_processing_linux_plugin

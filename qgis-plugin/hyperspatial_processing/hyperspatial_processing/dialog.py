@@ -46,7 +46,7 @@ class HyperspectralProcessingDialog(QDialog):
     def __init__(self, iface, parent=None):
         super(HyperspectralProcessingDialog, self).__init__(parent)
         self.iface = iface
-        self.setWindowTitle('Hyperspectral Index Processing')
+        self.setWindowTitle('HyperSpectral Processer')
         self.resize(820, 560)
 
         self.init_hpc_ui()

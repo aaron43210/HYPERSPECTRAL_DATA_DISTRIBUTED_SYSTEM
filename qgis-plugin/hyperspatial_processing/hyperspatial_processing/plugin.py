@@ -32,7 +32,7 @@ class HyperspectralProcessingPlugin:
             QCoreApplication.installTranslator(self.translator)
 
         self.actions = []
-        self.menu = 'Hyperspectral Index Processing'
+        self.menu = 'HyperSpectral Processer'
         self.first_start = None
         self.dialog = None
 
@@ -62,7 +62,7 @@ class HyperspectralProcessingPlugin:
         icon_path = os.path.join(self.plugin_dir, 'icons', 'icon.png')
         self.add_action(
             icon_path,
-            text='Hyperspectral Index Processing',
+            text='HyperSpectral Processer',
             callback=self.run,
             parent=self.iface.mainWindow()
         )
