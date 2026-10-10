@@ -30,3 +30,5 @@ metastore_db/
 
 # ---- Keep the bundled plugin binary (plugin requires it) ----
 !qgis-plugin/hyperspatial_bigdata/bin/hyperspatial_cli
+
+qgis-plugin/*/*.zip
