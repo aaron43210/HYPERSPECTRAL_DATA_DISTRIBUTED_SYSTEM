@@ -20,6 +20,9 @@ def main():
                         help="Directory containing the engine's tile_r*.tif outputs")
     parser.add_argument("--output",    required=True, help="Spark CSV output directory")
     parser.add_argument("--threshold", type=float, default=0.4)
+    parser.add_argument("--raster-out", default=None,
+                        help="Optional directory: write a per-pixel NDVI>=threshold "
+                             "veg-mask GeoTIFF per tile (for loading onto the canvas)")
     args = parser.parse_args()
     thr = float(args.threshold)
 
@@ -59,6 +62,26 @@ def main():
     count = result.count()
     result.write.mode("overwrite").csv(args.output, header=True)
     print(f"Q3: {count} tiles with per-pixel mean NDVI >= {thr}")
+
+    # Optional "pixel-based raster processing you can see": materialise the
+    # per-pixel veg mask (1 = NDVI>=thr, 0 = not) as one GeoTIFF per tile. The
+    # mask raster inherits the tile's CRS + geotransform from RS_MapAlgebra, so
+    # it lands correctly georeferenced and the plugin can drop it on the canvas.
+    # Streamed with toLocalIterator() so we never hold every tile in driver RAM.
+    if args.raster_out:
+        import os
+        os.makedirs(args.raster_out, exist_ok=True)
+        veg_tif = sedona.sql(f"SELECT path, RS_AsGeoTiff({veg_expr}) AS tif FROM tiles")
+        written = 0
+        for row in veg_tif.toLocalIterator():
+            if row["tif"] is None:
+                continue
+            stem = os.path.splitext(os.path.basename(row["path"]))[0]
+            dest = os.path.join(args.raster_out, f"{stem}_vegmask.tif")
+            with open(dest, "wb") as fh:
+                fh.write(row["tif"])
+            written += 1
+        print(f"Q3: wrote {written} per-pixel veg-mask GeoTIFF(s) to {args.raster_out}")
 
 
 if __name__ == "__main__":

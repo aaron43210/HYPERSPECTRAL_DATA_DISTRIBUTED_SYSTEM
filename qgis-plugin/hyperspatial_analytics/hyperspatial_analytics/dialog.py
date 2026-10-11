@@ -22,9 +22,10 @@ import threading
 
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QRadioButton, QDoubleSpinBox, QTextEdit, QFileDialog, QMessageBox,
+    QRadioButton, QDoubleSpinBox, QTextEdit, QFileDialog, QMessageBox, QCheckBox,
 )
 from qgis.PyQt.QtCore import pyqtSignal, QSettings
+from qgis.core import QgsRasterLayer, QgsProject
 
 from .spark_locator import resolve_spark_submit, spark_env, SPARK_SETTINGS_KEY
 
@@ -34,6 +35,7 @@ class SedonaAnalyticsDialog(QDialog):
     # Thread-safe bridges from the Spark worker thread back to the GUI thread.
     spark_log = pyqtSignal(str)
     spark_finished = pyqtSignal()
+    rasters_ready = pyqtSignal(str)
 
     def __init__(self, iface, parent=None):
         super(SedonaAnalyticsDialog, self).__init__(parent)
@@ -45,6 +47,7 @@ class SedonaAnalyticsDialog(QDialog):
 
         self.spark_log.connect(self.append_spark_log)
         self.spark_finished.connect(self.on_spark_finished)
+        self.rasters_ready.connect(self.on_rasters_ready)
 
     def append_spark_log(self, msg):
         self.txt_spark_log.append(msg)
@@ -52,6 +55,26 @@ class SedonaAnalyticsDialog(QDialog):
     def on_spark_finished(self):
         # Re-enable the button from the GUI thread (safe: driven by a signal).
         self.btn_spark.setEnabled(True)
+
+    def on_rasters_ready(self, raster_dir):
+        """Load any veg-mask GeoTIFFs the job wrote onto the QGIS canvas.
+
+        Runs on the GUI thread (signal slot) - QgsProject/QgsRasterLayer must not
+        be touched from the Spark worker thread.
+        """
+        import glob as _glob
+        tifs = sorted(_glob.glob(os.path.join(raster_dir, "*.tif")))
+        if not tifs:
+            self.txt_spark_log.append(f"No result rasters found in {raster_dir}")
+            return
+        loaded = 0
+        for tif in tifs:
+            name = os.path.splitext(os.path.basename(tif))[0]
+            layer = QgsRasterLayer(tif, name)
+            if layer.isValid():
+                QgsProject.instance().addMapLayer(layer)
+                loaded += 1
+        self.txt_spark_log.append(f"Loaded {loaded} result raster(s) onto the canvas.")
 
     # =========================================================================
     # SEDONA ANALYTICS UI
@@ -106,6 +129,12 @@ class SedonaAnalyticsDialog(QDialog):
         h3.addWidget(self.spin_ndvi)
         h3.addStretch()
         layout.addLayout(h3)
+
+        # Q3 only: materialise the per-pixel vegetation mask as GeoTIFFs and drop
+        # them on the canvas (pixel-based raster processing you can see).
+        self.chk_load_raster = QCheckBox(
+            "Q3: write per-pixel veg-mask GeoTIFFs and load them onto the canvas")
+        layout.addWidget(self.chk_load_raster)
 
         # Spark locator row (mirrors the processing plugin's engine Browse):
         # resolve spark-submit explicitly so a Finder-launched QGIS - which does
@@ -200,11 +229,17 @@ class SedonaAnalyticsDialog(QDialog):
         #   q1_aoi_filter.py  : --rasters <dir> --output <dir> --aoi  <geojson>
         #   q2_spatial_join.py: --rasters <dir> --agri   <geojson> --output <dir>
         #   q3_ndvi_filter.py : --rasters <dir> --output <dir> --threshold <float>
+        raster_out = None
         if script_name == "q3_ndvi_filter.py":
             spark_args = ["spark-submit", script_path,
                           "--rasters", rasters_dir,
                           "--output", out_dir,
                           "--threshold", str(self.spin_ndvi.value())]
+            if self.chk_load_raster.isChecked():
+                # Sibling dir (NOT inside the Spark CSV output dir, which Spark
+                # overwrites) to hold the per-pixel veg-mask GeoTIFFs.
+                raster_out = out_dir + "_rasters"
+                spark_args += ["--raster-out", raster_out]
         else:
             # Q1 and Q2 require an AOI / boundaries GeoJSON (no demo fallback).
             aoi_path = self.le_aoi.text().strip()
@@ -238,9 +273,9 @@ class SedonaAnalyticsDialog(QDialog):
         cmd = [spark_submit] + spark_args[1:]
 
         threading.Thread(target=self._spark_task,
-                         args=(cmd, out_dir, spark_submit), daemon=True).start()
+                         args=(cmd, out_dir, spark_submit, raster_out), daemon=True).start()
 
-    def _spark_task(self, cmd, out_dir, spark_submit=None):
+    def _spark_task(self, cmd, out_dir, spark_submit=None, raster_out=None):
         try:
             self.spark_log.emit(f"Executing: {' '.join(cmd)}\n")
             # spark_env() unsets HADOOP_CONF_DIR (a populated value crashes the
@@ -256,6 +291,9 @@ class SedonaAnalyticsDialog(QDialog):
             rc = proc.wait()
             if rc == 0:
                 self.spark_log.emit(f"\n--- SPARK JOB COMPLETE ---\nResults written to: {out_dir}")
+                # Load result rasters on the GUI thread (never from here).
+                if raster_out:
+                    self.rasters_ready.emit(raster_out)
             else:
                 self.spark_log.emit(f"\n--- SPARK JOB FAILED (exit code {rc}) ---")
         except Exception as e:

@@ -126,7 +126,22 @@ def resolve_spark_submit():
 
 
 def _detect_java_home():
-    """Best-effort JAVA_HOME. Honour an existing value, else ask macOS."""
+    """Best-effort JAVA_HOME, preferring a Spark 3.4-supported JDK (8/11/17).
+
+    On macOS we ask ``/usr/libexec/java_home -v`` for 17 then 11 before falling
+    back to an existing JAVA_HOME or the default JVM - this avoids silently
+    handing Spark 3.4 a Java 21/25 it cannot run on.
+    """
+    if sys.platform == 'darwin':
+        for ver in ('17', '11', '1.8'):
+            with contextlib.suppress(Exception):
+                out = subprocess.run(  # nosec B603 - fixed system tool, no shell
+                    ['/usr/libexec/java_home', '-v', ver],
+                    capture_output=True, text=True, timeout=10,
+                )
+                cand = out.stdout.strip()
+                if cand and os.path.isdir(cand):
+                    return cand
     jh = os.environ.get('JAVA_HOME')
     if jh and os.path.isdir(jh):
         return jh
