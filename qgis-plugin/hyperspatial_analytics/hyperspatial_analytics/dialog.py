@@ -24,7 +24,9 @@ from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QRadioButton, QDoubleSpinBox, QTextEdit, QFileDialog, QMessageBox,
 )
-from qgis.PyQt.QtCore import pyqtSignal
+from qgis.PyQt.QtCore import pyqtSignal, QSettings
+
+from .spark_locator import resolve_spark_submit, spark_env, SPARK_SETTINGS_KEY
 
 
 class SedonaAnalyticsDialog(QDialog):
@@ -105,6 +107,20 @@ class SedonaAnalyticsDialog(QDialog):
         h3.addStretch()
         layout.addLayout(h3)
 
+        # Spark locator row (mirrors the processing plugin's engine Browse):
+        # resolve spark-submit explicitly so a Finder-launched QGIS - which does
+        # NOT inherit the login-shell PATH on macOS - can still find it. The
+        # chosen path is remembered in QSettings.
+        h_spark = QHBoxLayout()
+        self.le_spark = QLineEdit()
+        self.le_spark.setReadOnly(True)
+        btn_spark_browse = QPushButton("Browse")
+        btn_spark_browse.clicked.connect(self._browse_spark_submit)
+        h_spark.addWidget(QLabel("Spark:"))
+        h_spark.addWidget(self.le_spark)
+        h_spark.addWidget(btn_spark_browse)
+        layout.addLayout(h_spark)
+
         self.btn_spark = QPushButton("RUN SPARK JOB")
         self.btn_spark.setStyleSheet("background-color: #28a745; color: white; font-weight: bold;")
         self.btn_spark.clicked.connect(self.run_analytics)
@@ -115,6 +131,26 @@ class SedonaAnalyticsDialog(QDialog):
         layout.addWidget(self.txt_spark_log)
 
         self.setLayout(layout)
+        self._spark_submit = None
+        self._refresh_spark_label()
+
+    def _refresh_spark_label(self):
+        """Resolve spark-submit and reflect it in the Spark row (red if missing)."""
+        path, source, _err = resolve_spark_submit()
+        self._spark_submit = path
+        if path:
+            self.le_spark.setStyleSheet("")
+            self.le_spark.setText("%s  (%s)" % (path, source))
+        else:
+            self.le_spark.setStyleSheet("color: #c0392b;")
+            self.le_spark.setText("spark-submit not found - click Browse to set it")
+
+    def _browse_spark_submit(self):
+        start = "/opt/homebrew/bin" if sys.platform == "darwin" else ""
+        path = QFileDialog.getOpenFileName(self, "Select spark-submit", start)[0]
+        if path:
+            QSettings().setValue(SPARK_SETTINGS_KEY, path)
+            self._refresh_spark_label()
 
     def run_analytics(self):
         import glob as _glob
@@ -189,36 +225,29 @@ class SedonaAnalyticsDialog(QDialog):
                 spark_args = ["spark-submit", script_path,
                               "--rasters", rasters_dir, "--agri", aoi_path, "--output", out_dir]
 
-        # Resolve spark-submit portably. When QGIS is launched from a terminal
-        # with the env active it is already on PATH; from the GUI it may not be.
-        # On POSIX, fall back to the user's login shell (sources their profile).
-        # On Windows there is no login shell to synthesize, so surface a clear
-        # message instead of inventing a /bin/bash call that cannot exist.
-        import shutil, shlex
-        spark_submit = shutil.which("spark-submit")
-        if spark_submit:
-            cmd = [spark_submit] + spark_args[1:]
-        elif sys.platform.startswith('win'):
-            QMessageBox.warning(self, "spark-submit not found",
-                "spark-submit is not on PATH.\n\n"
-                "Install Apache Spark and make sure spark-submit (spark-submit.cmd) "
-                "is on your PATH, then run the query again.")
+        # Resolve spark-submit via the shared locator (QSettings -> SPARK_HOME ->
+        # PATH -> common dirs -> login shell), mirroring the engine Browse flow.
+        # This fixes the Finder-launched-QGIS case where the GUI has no shell PATH.
+        spark_submit, _source, err = resolve_spark_submit()
+        if not spark_submit:
+            QMessageBox.warning(self, "spark-submit not found", err)
             self.btn_spark.setEnabled(True)
+            self._refresh_spark_label()
             return
-        else:
-            cmd_str = " ".join(shlex.quote(a) for a in spark_args)
-            shell = os.environ.get("SHELL") or "/bin/bash"
-            cmd = [shell, "-l", "-c", cmd_str]
+        self._refresh_spark_label()
+        cmd = [spark_submit] + spark_args[1:]
 
-        threading.Thread(target=self._spark_task, args=(cmd, out_dir), daemon=True).start()
+        threading.Thread(target=self._spark_task,
+                         args=(cmd, out_dir, spark_submit), daemon=True).start()
 
-    def _spark_task(self, cmd, out_dir):
+    def _spark_task(self, cmd, out_dir, spark_submit=None):
         try:
             self.spark_log.emit(f"Executing: {' '.join(cmd)}\n")
-            # CRITICAL: unset HADOOP_CONF_DIR so Spark does not parse local Hadoop
-            # XML (a populated value crashes the JVM on macOS).
-            env = os.environ.copy()
-            env["HADOOP_CONF_DIR"] = ""
+            # spark_env() unsets HADOOP_CONF_DIR (a populated value crashes the
+            # JVM on macOS), sets JAVA_HOME, and prepends the spark-submit / conda
+            # bin dirs to PATH so the child finds python/pyspark/java even when
+            # QGIS was launched from Finder without a shell environment.
+            env = spark_env(spark_submit)
 
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
             for line in iter(proc.stdout.readline, ''):
