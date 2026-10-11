@@ -29,7 +29,7 @@ def main():
 
     sedona = get_sedona_session("Q2-SpatialJoin-Raster")
     tiles = load_tiles(sedona, args.rasters, view="tiles")
-    if tiles.rdd.isEmpty():
+    if tiles.limit(1).count() == 0:   # JVM-side; .rdd would serialize rast to Python
         print("Q2: no tiles found under --rasters")
         return
 
@@ -58,10 +58,10 @@ def main():
     sedona.sql("""
         SELECT
             a.field_id, a.crop_type, t.path,
-            COALESCE(RS_ZonalStats(t.rast, a.geom, t.ndvi_band, 'count', true, true), 0) AS px,
-            RS_ZonalStats(t.rast, a.geom, t.ndvi_band, 'mean', true, true) AS m_ndvi,
-            RS_ZonalStats(t.rast, a.geom, t.ndwi_band, 'mean', true, true) AS m_ndwi,
-            RS_ZonalStats(t.rast, a.geom, t.ndbi_band, 'mean', true, true) AS m_ndbi
+            COALESCE(RS_ZonalStats(t.rast, a.geom, t.ndvi_band, 'count', true), 0) AS px,
+            RS_ZonalStats(t.rast, a.geom, t.ndvi_band, 'mean', true) AS m_ndvi,
+            RS_ZonalStats(t.rast, a.geom, t.ndwi_band, 'mean', true) AS m_ndwi,
+            RS_ZonalStats(t.rast, a.geom, t.ndbi_band, 'mean', true) AS m_ndbi
         FROM tiles t JOIN agri a ON ST_Intersects(t.env4326, a.geom)
     """).createOrReplaceTempView("per_tile")
 

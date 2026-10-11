@@ -51,7 +51,7 @@ def main():
 
     sedona = get_sedona_session("Q1-AOIFilter-Raster")
     tiles = load_tiles(sedona, args.rasters, view="tiles")
-    if tiles.rdd.isEmpty():
+    if tiles.limit(1).count() == 0:   # JVM-side; .rdd would serialize rast to Python
         print("Q1: no tiles found under --rasters")
         return
 
@@ -66,8 +66,8 @@ def main():
     result = sedona.sql("""
         SELECT
             t.path,
-            RS_ZonalStats(t.rast, a.geom, t.ndvi_band, 'mean',  true, true) AS mean_ndvi_in_aoi,
-            RS_ZonalStats(t.rast, a.geom, t.ndvi_band, 'count', true, true) AS valid_px_in_aoi
+            RS_ZonalStats(t.rast, a.geom, t.ndvi_band, 'mean',  true) AS mean_ndvi_in_aoi,
+            RS_ZonalStats(t.rast, a.geom, t.ndvi_band, 'count', true) AS valid_px_in_aoi
         FROM tiles t, aoi a
         WHERE ST_Intersects(t.env4326, a.geom)
     """)

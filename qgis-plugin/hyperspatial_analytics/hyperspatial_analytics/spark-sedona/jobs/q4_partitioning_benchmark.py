@@ -41,7 +41,7 @@ def run_join(sedona, rasters_dir, agri_path, repartition):
     start = time.perf_counter()
     result = sedona.sql(f"""
         SELECT a.field_id,
-               RS_ZonalStats(t.rast, a.geom, t.ndvi_band, 'count', true, true) AS px
+               RS_ZonalStats(t.rast, a.geom, t.ndvi_band, 'count', true) AS px
         FROM tiles_{suffix} t JOIN agri_{suffix} a ON ST_Intersects(t.env4326, a.geom)
     """)
     result.cache()

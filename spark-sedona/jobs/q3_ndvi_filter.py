@@ -28,7 +28,10 @@ def main():
 
     sedona = get_sedona_session("Q3-NDVIFilter-Raster")
     tiles = load_tiles(sedona, args.rasters, view="tiles")
-    if tiles.rdd.isEmpty():
+    # Emptiness check must stay JVM-side: tiles.rdd / take / head would serialize
+    # the `rast` RasterType column to Python, which Sedona 1.5.1 cannot do
+    # (RasterType.deserialize is unimplemented). limit(1).count() never crosses.
+    if tiles.limit(1).count() == 0:
         print("Q3: no tiles found under --rasters")
         return
 
@@ -38,23 +41,28 @@ def main():
     ndvi_band = nbands - 6     # 1-based (RS_ZonalStats)
     ndvi0 = ndvi_band - 1      # 0-based (RS_MapAlgebra)
 
-    # Per-pixel vegetation mask: 1 where NDVI >= threshold, else 0. nodata NDVI
-    # is 0.0 (< threshold) so it contributes 0, i.e. counts as non-vegetation.
+    # Per-pixel vegetation mask: 1 where NDVI >= threshold, else 0. Used for the
+    # optional --raster-out GeoTIFF (the visible per-pixel product).
+    #
+    # NOTE: we deliberately do NOT derive a scalar veg_px/veg_fraction here.
+    # Sedona 1.5.1's RS_ZonalStats cannot count value-matching pixels: 'sum'/
+    # 'mean' on a Jiffle raster return NaN (source-nodata -> NaN, inexcludable
+    # since NaN != NaN) and 'count' counts the whole footprint regardless of
+    # null/con(). The reliable per-tile scalars are mean_ndvi and valid_px; the
+    # per-pixel vegetation answer lives in the mask raster below.
     veg_expr = (f"RS_MapAlgebra(rast, 'D', "
                 f"'out = (rast[{ndvi0}] >= {thr}) ? 1.0 : 0.0;')")
 
     sedona.sql(f"""
         SELECT
             path,
-            RS_ZonalStats(rast, RS_Envelope(rast), {ndvi_band}, 'mean',  true, true) AS mean_ndvi,
-            RS_ZonalStats(rast, RS_Envelope(rast), {ndvi_band}, 'count', true, true) AS valid_px,
-            RS_ZonalStats({veg_expr}, RS_Envelope(rast), 1, 'sum', false, true)      AS veg_px
+            RS_ZonalStats(rast, RS_Envelope(rast), {ndvi_band}, 'mean',  true) AS mean_ndvi,
+            RS_ZonalStats(rast, RS_Envelope(rast), {ndvi_band}, 'count', true) AS valid_px
         FROM tiles
     """).createOrReplaceTempView("stats")
 
     result = sedona.sql(f"""
-        SELECT path, mean_ndvi, valid_px, veg_px,
-               CASE WHEN valid_px > 0 THEN veg_px / valid_px ELSE 0.0 END AS veg_fraction
+        SELECT path, mean_ndvi, valid_px
         FROM stats
         WHERE mean_ndvi >= {thr}
     """)
@@ -64,24 +72,28 @@ def main():
     print(f"Q3: {count} tiles with per-pixel mean NDVI >= {thr}")
 
     # Optional "pixel-based raster processing you can see": materialise the
-    # per-pixel veg mask (1 = NDVI>=thr, 0 = not) as one GeoTIFF per tile. The
-    # mask raster inherits the tile's CRS + geotransform from RS_MapAlgebra, so
-    # it lands correctly georeferenced and the plugin can drop it on the canvas.
-    # Streamed with toLocalIterator() so we never hold every tile in driver RAM.
+    # per-pixel veg mask (1 = NDVI>=thr, 0 = not) as one GeoTIFF per tile.
+    #
+    # It MUST stay JVM-side: Sedona 1.5.1's Python RasterType.deserialize is
+    # unimplemented, so collect()/toLocalIterator() on a raster (or RS_AsGeoTiff)
+    # column throws "RasterType.deserialize is not implemented yet". The native
+    # `raster` data source (RasterFileFormat) writes one GeoTIFF per row entirely
+    # in the JVM - no Python round-trip - naming each file from `rasterPathField`.
     if args.raster_out:
-        import os
-        os.makedirs(args.raster_out, exist_ok=True)
-        veg_tif = sedona.sql(f"SELECT path, RS_AsGeoTiff({veg_expr}) AS tif FROM tiles")
-        written = 0
-        for row in veg_tif.toLocalIterator():
-            if row["tif"] is None:
-                continue
-            stem = os.path.splitext(os.path.basename(row["path"]))[0]
-            dest = os.path.join(args.raster_out, f"{stem}_vegmask.tif")
-            with open(dest, "wb") as fh:
-                fh.write(row["tif"])
-            written += 1
-        print(f"Q3: wrote {written} per-pixel veg-mask GeoTIFF(s) to {args.raster_out}")
+        veg_df = sedona.sql(f"""
+            SELECT
+                RS_AsGeoTiff({veg_expr}) AS content,
+                concat(regexp_replace(element_at(split(path, '/'), -1),
+                                      '\\.tif$', ''), '_vegmask') AS name
+            FROM tiles
+        """)
+        (veg_df.write.format("raster")
+               .option("rasterField", "content")
+               .option("rasterPathField", "name")
+               .option("fileExtension", ".tif")
+               .mode("overwrite")
+               .save(args.raster_out))
+        print(f"Q3: wrote per-pixel veg-mask GeoTIFF(s) to {args.raster_out}")
 
 
 if __name__ == "__main__":

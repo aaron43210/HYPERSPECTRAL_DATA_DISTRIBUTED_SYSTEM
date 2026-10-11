@@ -20,7 +20,7 @@ def get_sedona_session(app_name: str = "HyperSpatialJob",
                 "org.apache.sedona.core.serde.SedonaKryoRegistrator")
         .config("spark.jars.packages",
                 "org.apache.sedona:sedona-spark-shaded-3.4_2.12:1.5.1,"
-                "org.datasyslab:geotools-wrapper:1.5.0-28.2")
+                "org.datasyslab:geotools-wrapper:1.5.1-28.2")
         .config("spark.jars.repositories",
                 "https://artifacts.unidata.ucar.edu/repository/unidata-all")
     )

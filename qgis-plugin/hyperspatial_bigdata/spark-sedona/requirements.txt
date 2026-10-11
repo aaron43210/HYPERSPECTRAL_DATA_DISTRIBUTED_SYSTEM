@@ -1,8 +1,0 @@
-numpy>=1.24
-pandas>=1.5
-geopandas>=1.0
-shapely>=2.0
-pyspark==3.4.*
-apache-sedona[spark]==1.5.1
-# NOTE: pyarrow and gdal must NOT be pip-installed together.
-# Install via conda: conda env create -f ../../environment.yml
