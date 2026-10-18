@@ -1,0 +1,15 @@
+operation,requested_mode,ran_mode,threads,engine_sec_median,wall_sec_median,peak_rss_gb,repeats
+indices,serial,serial,1,8.531,8.670,1.38,3
+indices,openmp,openmp,1,8.597,8.730,1.38,3
+indices,openmp,openmp,2,5.250,5.390,2.46,3
+indices,openmp,openmp,4,3.524,3.670,3.42,3
+indices,openmp,openmp,8,2.519,2.690,4.21,3
+indices,openmp,openmp,12,2.667,2.840,4.37,3
+indices,gpu,gpu,,9.135,9.270,1.39,3
+pca,openmp,openmp,0,5.959,6.110,2.77,3
+pca,gpu,gpu,,5.788,5.940,2.69,3
+sam,openmp,openmp,0,0.987,1.140,2.53,3
+sam,gpu,gpu,,1.145,1.280,0.67,3
+# scene,ENMAP01-____L2A-DT0000001049_20220612T105735Z_028_V010506_20260529T090933Z-SPECTRAL_IMAGE.BSQ
+# machine,Apple M4 Pro 12-core (8P+4E) 24 GB
+# sam_reference_pixel,row=1082 col=738 (EnMAP QL water class)

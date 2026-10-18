@@ -61,10 +61,13 @@ def main():
         FROM tiles
     """).createOrReplaceTempView("stats")
 
+    # isnan guard: a tile with no valid pixels has mean_ndvi = NaN, and Spark
+    # SQL orders NaN above every number, so `NaN >= thr` is TRUE - empty
+    # background tiles would otherwise be reported as vegetated.
     result = sedona.sql(f"""
         SELECT path, mean_ndvi, valid_px
         FROM stats
-        WHERE mean_ndvi >= {thr}
+        WHERE NOT isnan(mean_ndvi) AND mean_ndvi >= {thr}
     """)
     result.cache()
     count = result.count()

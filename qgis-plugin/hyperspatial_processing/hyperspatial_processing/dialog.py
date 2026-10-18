@@ -651,7 +651,30 @@ class HyperspectralProcessingDialog(QDialog):
                          args=(cmd, self.le_output.text(), is_vrt_mode, selected, operation),
                          daemon=True).start()
 
+    def _open_index_layers(self, out_dir, is_vrt_mode, selected):
+        """Worker thread: open the selected index layers, owned by the GUI thread.
+
+        QgsRasterLayer is a QObject; a layer created here must be moved to the
+        main thread before QgsProject (GUI thread) takes it - the QgsTask pattern.
+        """
+        from qgis.core import QgsRasterLayer
+        from qgis.PyQt.QtCore import QCoreApplication
+        main_thread = QCoreApplication.instance().thread()
+        ext = ".vrt" if is_vrt_mode else ".tif"
+        names = ["ndvi", "ndwi", "ndbi", "savi", "evi", "ndmi", "msavi"]
+        layers = []
+        for i, key in enumerate(names):
+            path = os.path.join(out_dir, f"{key}_layer{ext}")
+            if not (selected[i] and os.path.exists(path)):
+                continue
+            layer = QgsRasterLayer(path, f"Computed {key.upper()}")
+            if layer.isValid():
+                layer.moveToThread(main_thread)
+                layers.append(layer)
+        return layers
+
     def _hpc_task(self, cmd, out_dir, is_vrt_mode, selected, operation):
+        self._prepared_layers = None
         try:
             self.hpc_log.emit(f"Executing: {' '.join(cmd)}\n")
             # On Windows, launching a console .exe from the GUI would flash a
@@ -715,6 +738,11 @@ class HyperspectralProcessingDialog(QDialog):
                     for tile in tiles:
                         with contextlib.suppress(OSError):
                             os.remove(tile)
+
+                # Opening each index VRT costs ~0.4 s (GDAL opens every 231-band
+                # tile behind it), i.e. a ~2.6 s freeze for 7 layers if done in
+                # the GUI slot. Open them here and hand them to the GUI thread.
+                self._prepared_layers = self._open_index_layers(out_dir, is_vrt_mode, selected)
         except Exception as e:
             self.hpc_log.emit(f"Process Failed: {e}")
         finally:
@@ -759,12 +787,23 @@ class HyperspectralProcessingDialog(QDialog):
         if self.chk_ndmi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"ndmi_layer{ext}"), "Computed NDMI"))
         if self.chk_msavi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"msavi_layer{ext}"), "Computed MSAVI"))
 
-        for path, name in layers_to_load:
-            if not os.path.exists(path):
-                continue
-            # iface.addRasterLayer guarantees the layer lands in the layer
-            # tree (legend) + canvas, not just the project registry.
-            layer = self.iface.addRasterLayer(path, name)
+        # Layers already opened on the worker thread (fast path); otherwise open here.
+        prepared = getattr(self, "_prepared_layers", None)
+        self._prepared_layers = None
+        if prepared is not None:
+            from qgis.core import QgsProject
+            items = [(None, l.name(), l) for l in prepared]
+        else:
+            items = [(p, n, None) for p, n in layers_to_load if os.path.exists(p)]
+
+        for path, name, layer in items:
+            if layer is not None:
+                # addMapLayer also adds it to the layer tree (legend).
+                QgsProject.instance().addMapLayer(layer)
+            else:
+                # iface.addRasterLayer guarantees the layer lands in the layer
+                # tree (legend) + canvas, not just the project registry.
+                layer = self.iface.addRasterLayer(path, name)
             if layer and layer.isValid():
                 from qgis.core import QgsContrastEnhancement
                 renderer = layer.renderer()

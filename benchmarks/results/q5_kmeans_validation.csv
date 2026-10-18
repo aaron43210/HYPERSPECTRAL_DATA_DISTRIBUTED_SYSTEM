@@ -1,0 +1,10 @@
+check,value,result
+Q4 mean NDVI == NumPy truth (±0.001),0.5616 vs 0.5616,PASS
+Q4 valid pixels == NumPy truth minus outer-ring pixels,1069486 vs 1069486 (13 valid pixels on the raster edge),PASS
+Q5 MLlib vs Jiffle agreement >= 99.99%,100.000000%,PASS
+Q5 job wall time < 30 s,13.0 s (spark-submit total 14.5 s),PASS
+Q5 nodata pixels == QL background (class 3),461445 vs 461445,PASS
+Q5 'Water' clusters [4] iou >= 0.5,IoU=0.578 precision=0.820 recall=0.662,PASS
+Q5 'Snow/ice' clusters [6] precision >= 0.85,IoU=0.655 precision=0.922 recall=0.693,PASS
+scene,ENMAP01-____L2A-DT0000001049_20220612T105735Z_028_V010506_20260529T090933Z-SPECTRAL_IMAGE.BSQ,
+k / features,8 / shape_brightness,

@@ -8,9 +8,12 @@ computed in the JVM with Sedona map algebra:
 
     out = (nir + red) == 0 ? NODATA : (nir - red) / (nir + red)
 
-Background pixels (nir+red == 0) are mapped to a real sentinel (-9999), NOT NaN,
-so RS_ZonalStats can exclude them by value - otherwise mean/count come back NaN
-(NaN != NaN is inexcludable in Sedona 1.5.1).
+Background pixels are mapped to a real sentinel (-9999), NOT NaN, so
+RS_ZonalStats can exclude them by value - otherwise mean/count come back NaN
+(NaN != NaN is inexcludable in Sedona 1.5.1). Background is a pixel whose RED or
+NIR equals --nodata (the cube's own sentinel, e.g. EnMAP -32768, passed by the
+plugin) or whose nir+red == 0. Without --nodata a non-zero background such as
+EnMAP's would be scored as NDVI 0 and drag the mean down.
 
 Requires Apache Sedona >= 1.5.1 (raster) with geotools-wrapper 1.5.1-28.2 (Jiffle).
 """
@@ -30,6 +33,9 @@ def main():
     p.add_argument("--threshold", type=float, default=0.4)
     p.add_argument("--raster-out", default=None,
                    help="Optional dir: write the per-pixel NDVI GeoTIFF for the canvas")
+    p.add_argument("--nodata", type=float, default=None,
+                   help="Source cube nodata value (stored units); pixels with RED or NIR "
+                        "equal to it are excluded")
     args = p.parse_args()
     red0, nir0 = args.red_band - 1, args.nir_band - 1
 
@@ -46,9 +52,13 @@ def main():
         return
 
     # Per-pixel NDVI, background -> sentinel nodata (not NaN) so stats can exclude it.
-    ndvi = (f"RS_MapAlgebra(rast, 'D', "
-            f"'out = (rast[{nir0}] + rast[{red0}]) == 0 ? {NODATA} : "
-            f"(rast[{nir0}] - rast[{red0}]) / (rast[{nir0}] + rast[{red0}]);', {NODATA})")
+    expr = (f"(rast[{nir0}] + rast[{red0}]) == 0 ? {NODATA} : "
+            f"(rast[{nir0}] - rast[{red0}]) / (rast[{nir0}] + rast[{red0}])")
+    if args.nodata is not None:
+        nd = f"({float(args.nodata):.6f})"
+        expr = (f"rast[{nir0}] == {nd} ? {NODATA} : "
+                f"(rast[{red0}] == {nd} ? {NODATA} : ({expr}))")
+    ndvi = f"RS_MapAlgebra(rast, 'D', 'out = {expr};', {NODATA})"
 
     sedona.sql(f"""
         SELECT path,

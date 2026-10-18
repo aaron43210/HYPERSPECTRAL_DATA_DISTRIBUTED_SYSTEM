@@ -64,7 +64,9 @@ Treat each boundary below as an API.
 
 `spark-submit --packages <sedona jars> <job>.py <args>`, with `HADOOP_CONF_DIR=""`
 in the child env (unset it — a populated value triggers local XML parsing that
-crashes the JVM on macOS). The Sedona JVM jars **must** be on the `spark-submit`
+crashes the JVM on macOS) and with `PYTHONHOME`/`PYTHONPATH` removed (QGIS's
+embedded Python may export them; the Spark env's interpreter would load QGIS's
+stdlib and die before Spark starts). The Sedona JVM jars **must** be on the `spark-submit`
 command line (a `SedonaContext` config can't add them after the JVM starts):
 
 ```
@@ -80,11 +82,33 @@ between jobs:**
 | `q1_aoi_filter.py` | `--rasters <dir>` `--output <dir>` `--aoi <geojson>` | — |
 | `q2_spatial_join.py` | `--rasters <dir>` `--agri <geojson>` `--output <dir>` | — |
 | `q3_ndvi_filter.py` | `--rasters <dir>` `--output <dir>` | `--threshold <float>` (default 0.4), `--raster-out <dir>` (per-pixel veg-mask GeoTIFF per tile) |
-| `q_raw_ndvi.py` (Raw cube NDVI) | `--rasters <dir>` `--output <dir>` `--red-band <n>` `--nir-band <n>` | `--threshold <float>`, `--raster-out <dir>` |
+| `q_raw_ndvi.py` (Raw cube NDVI) | `--rasters <dir>` `--output <dir>` `--red-band <n>` `--nir-band <n>` | `--nodata <float>` (the cube's sentinel; the plugin always passes it when the cube declares one), `--threshold <float>`, `--raster-out <dir>` |
+| `q5_kmeans.py` (K-Means land cover) | `--rasters <dir>` `--output <dir>` | `--raster-out <dir>`, `--k <2-254>` (8), `--features shape_brightness\|shape\|raw`, `--sample <(0,1]>` (0.1), `--nodata <float>`, `--scale <float>` (stored → reflectance, EnMAP 0.0001), `--roles blue,green,…`, `--seed` (42), `--max-iter` (50), `--verify` |
 
-> `--rasters` is the engine output **directory** holding `tile_r*.tif` (for
-> `q_raw_ndvi.py` it is a directory holding the 2-band RED+NIR GeoTIFF the plugin
-> prepares from the raw cube — RED/NIR auto-detected from wavelength metadata).
+> `--rasters` is a **directory** holding `tile_r*.tif`. For Q1–Q3 the plugin does
+> **not** pass the engine output directory itself: a worker thread first copies
+> only the 7 trailing index bands of every engine tile into a temp directory
+> (`raster_prep.extract_index_tiles`) and passes that. Decoding the full
+> 224 + 7-band tiles (~242 MB per 512-px tile) exhausted the Spark heap — every
+> one of Q1–Q3 hit `OutOfMemoryError` on an EnMAP scene even at 6 GB — while
+> the 7-band copies (~3.5 MB) run at the default 1 GB. Band order is kept, so
+> index addressing by offset from `RS_NumBands` is unchanged, and the temp dir
+> keeps earlier outputs under the tiles dir (e.g. `tile_r*_vegmask.tif`) out of
+> the recursive `tile_r*.tif` glob. For `q_raw_ndvi.py` / `q5_kmeans.py` it is a
+> directory of GeoTIFFs the plugin prepares from the raw cube (bands
+> auto-detected from wavelength metadata).
+>
+> **Raw-cube tiles carry raw stored values with no scale/offset and no nodata
+> flag** (`raster_prep.prepare_band_tiles`). GeoTools applies any GeoTIFF scale on
+> read, which would shift the nodata sentinel (EnMAP −32768 → −3.2768); the
+> sentinel therefore travels as `--nodata` instead. Q5 tiles are 256 px (a whole
+> scene in one raster row exhausts the default 1 GB driver heap).
+>
+> **Q5 outputs:** `--output/clusters.csv` (`cluster, suggested_label, pixels, pct,
+> ndvi, ndwi, ndsi, refl_<role>…`) and `--output/run_info.csv` (key,value), both
+> plain CSV files written by the driver; `--raster-out` gets one unsigned-byte
+> class-map GeoTIFF per tile (value = cluster id, nodata 255), which the plugin
+> mosaics into one VRT.
 > Every job requires `--output`. A wrong/missing name makes argparse exit
 > non-zero *before Spark starts* — the classic "the button does nothing" failure.
 

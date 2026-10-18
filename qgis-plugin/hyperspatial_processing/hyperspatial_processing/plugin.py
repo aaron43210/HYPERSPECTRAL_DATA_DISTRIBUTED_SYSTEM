@@ -72,6 +72,20 @@ class HyperspectralProcessingPlugin:
         for action in self.actions:
             self.iface.removePluginMenu(self.menu, action)
             self.iface.removeToolBarIcon(action)
+        self.actions = []
+        # Release the dialog too, so reloading/uninstalling the plugin leaves
+        # no orphaned window or SAM map tool behind.
+        if self.dialog is not None:
+            try:
+                tool = getattr(self.dialog, "_sam_pick_tool", None)
+                if tool is not None and self.iface.mapCanvas().mapTool() is tool:
+                    self.iface.mapCanvas().unsetMapTool(tool)
+                self.dialog.close()
+                self.dialog.deleteLater()
+            except Exception:
+                pass
+            self.dialog = None
+        self.first_start = True
 
     def run(self):
         # Lazily build the dialog on first use.

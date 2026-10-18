@@ -1,0 +1,14 @@
+job,path,mean_ndvi_in_aoi,valid_px_in_aoi,field_id,crop_type,tile_count,pixel_count,mean_ndvi,mean_ndwi,mean_ndbi,valid_px
+Q1,tile_r0512_c0512.tif,0.5854721582202088,65653.0,,,,,,,,
+Q1,tile_r0512_c0000.tif,0.6129796048727696,7838.0,,,,,,,,
+Q1,tile_r0000_c0512.tif,0.5607021504557274,14740.0,,,,,,,,
+Q1,tile_r0000_c0000.tif,0.8414853850210255,1760.0,,,,,,,,
+Q2,,,,Z2_glacier,glacier,2,3597,-0.05193331419372911,0.04851940611604742,-0.6300651323205421,
+Q2,,,,Z4_meadow,meadow,2,6352,0.33013103107897496,-0.3435327866156016,0.07361522556021735,
+Q2,,,,Z1_lake,lake,1,400,-0.37569381898560084,0.6692274072789588,0.06436684694523945,
+Q2,,,,Z3_forest,forest,1,6400,0.7658264780160973,-0.6786942722438839,-0.22996653708730266,
+Q3,tile_r0512_c0512.tif,,,,,,,0.4117558421144204,,,261056.0
+Q3,tile_r0512_c0000.tif,,,,,,,0.7038052467145305,,,230073.0
+Q3,tile_r0000_c0512.tif,,,,,,,0.6526523932138935,,,207104.0
+Q3,tile_r0000_c0000.tif,,,,,,,0.7438327946451737,,,156568.0
+# Q1/Q2: docs/deliverables/data/demo_aoi.geojson + demo_zones.geojson (demonstration polygons); Q3: threshold 0.4, after the NaN-guard fix; input = engine indices tiles (512 px) of the EnMAP test scene

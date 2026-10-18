@@ -61,6 +61,18 @@ a Browse row). Jobs:
 - **Q4 — Raw-cube NDVI:** computes NDVI per pixel straight from a raw BSQ/ENVI/
   GeoTIFF cube via Sedona `RS_MapAlgebra`, independent of the C++ engine
   (RED/NIR bands auto-detected from wavelength metadata).
+- **Q5 — K-Means land cover (ML):** unsupervised Spark MLlib K-Means on a raw
+  cube's blue/green/red/NIR/SWIR bands (picked by wavelength, no labels needed).
+  The trained model is compiled into a Sedona Jiffle script and applied to every
+  pixel inside the JVM; the class map loads onto the canvas with a legend whose
+  labels (snow/ice, water, vegetation, rock/soil, …) are suggested from each
+  cluster's mean NDVI/NDWI/NDSI.
+
+Analytics tests live in `qgis-plugin/hyperspatial_analytics/tests/` (outside the
+packaged plugin): `test_ml_jiffle.py` (unit tests, no Spark),
+`validate_raw_cube_jobs.py` (end-to-end Q4/Q5 on a real EnMAP scene, checked
+against NumPy and the scene's QL masks) and `qgis_dialog_smoke.py` (drives the
+real dialog headlessly inside QGIS's Python).
 
 Spark runs as a background subprocess so the QGIS UI is never blocked; query
 outputs are written as CSV directories.

@@ -235,8 +235,13 @@ The OpenCL kernel (`calc_index`) is a **line-for-line port** of
 `SpectralFeatures.hpp` — same formulas, same ×10 000 de-scaling, same "all operands
 non-zero or the index is 0.0" rule, same `[−1,1]` clamp — so `gpu` and `openmp`
 produce identical rasters. The host side resolves bands by 1-based GDAL index,
-serialises dispatch with a mutex (safe inside the OpenMP tile loop), and **falls
-back to the CPU path per tile** if OpenCL init or any dispatch fails. If built
+serialises dispatch with a mutex, and **falls back to the CPU path per tile** if
+OpenCL init or any dispatch fails. **In gpu mode the tile loop runs on a single
+host thread** (`#pragma omp parallel for … if(runParallel && !use_gpu)`): Apple's
+OpenCL queue was found to corrupt results when driven from several host threads
+even behind the mutex. Tile reads and writes are therefore serial in gpu mode,
+which is why an I/O-bound `indices` run is no faster on the GPU (9.1 s) than in
+serial mode (8.5 s) on the Apple M4 Pro test machine. If built
 without an OpenCL SDK (`-DUSE_OPENCL=OFF` or none found), `--mode gpu` warns and
 runs on CPU. The `RESULT mode=` line reports what actually ran (`gpu` only when the
 GPU initialised).
@@ -301,11 +306,27 @@ macOS). The Sedona JVM jars are put on the `spark-submit` command line with
 `org.datasyslab:geotools-wrapper:1.5.1-28.2`) — a `SedonaContext` config has no
 effect once the JVM is already started. `spark-submit` is resolved with
 `shutil.which`; if absent (QGIS launched from Finder without the env on PATH) the
-user sets it via **Browse**. A radio group picks the query (Q1–Q4, §3); the worker
+user sets it via **Browse**. A radio group picks the query (Q1–Q5, §3); the worker
 reports the child's **exit code** — a non-zero exit is shown as a failure, not a
-false "complete". For **Q4 (Raw cube NDVI)** the plugin first auto-detects RED/NIR
+false "complete". `spark_env()` also drops `PYTHONHOME`/`PYTHONPATH` from the child
+env: QGIS's embedded Python may export them, and the Spark env's (different
+version) interpreter would otherwise load QGIS's stdlib and die before Spark
+starts. For **Q4 (Raw cube NDVI)** the plugin first auto-detects RED/NIR
 from the cube's wavelength metadata (`raster_prep.detect_red_nir`) and extracts a
-2-band RED+NIR GeoTIFF before submitting the job.
+2-band RED+NIR GeoTIFF before submitting the job. For **Q5 (K-Means)** a worker
+thread picks blue/green/red/NIR/SWIR1/SWIR2 by wavelength
+(`raster_prep.detect_bands`), tiles them at 256 px (`prepare_band_tiles`), runs
+the job, and mosaics the per-tile class maps into one VRT; the GUI slot adds it
+with a paletted legend built from the job's `clusters.csv`.
+
+**Raw-cube tile contract (Q4/Q5).** `gdal.Translate` copies the cube's
+scale/offset into the GeoTIFF (EnMAP: ENVI `data gain values` = 0.0001) and
+GeoTools **applies it on read**, so EnMAP's −32768 background reaches Sedona as
+−3.2768 and no nodata test matches. `prepare_band_tiles` therefore strips
+scale/offset and the nodata flag (tiles keep raw stored values) and returns the
+source nodata, which the plugin passes to the job as `--nodata`. Before this,
+Q4 averaged the ~30 % background in as NDVI 0 (EnMAP test scene: 0.393 instead
+of 0.562).
 
 ---
 
@@ -333,17 +354,42 @@ manual transform.
 | `q1_aoi_filter.py` (Q1) | `--rasters --output --aoi` | NDVI zonal stats over pixels inside an AOI |
 | `q2_spatial_join.py` (Q2) | `--rasters --agri --output` | zonal NDVI/NDWI/NDBI per field, pixel-count-weighted across tiles (a true per-field mean, not an average of per-tile averages) |
 | `q3_ndvi_filter.py` (Q3) | `--rasters --output [--threshold] [--raster-out]` | per-pixel mean NDVI + vegetation-pixel fraction per tile; with `--raster-out`, also writes a per-pixel veg-mask GeoTIFF per tile (via `RS_MapAlgebra`) for loading onto the canvas |
-| `q_raw_ndvi.py` (Q4, Raw cube NDVI) | `--rasters --output --red-band --nir-band [--threshold] [--raster-out]` | computes NDVI per-pixel straight from a raw BSQ/ENVI/GeoTIFF cube via `RS_MapAlgebra`, **independent of the engine**; the plugin auto-detects RED/NIR from wavelengths and extracts a 2-band cube first |
+| `q_raw_ndvi.py` (Q4, Raw cube NDVI) | `--rasters --output --red-band --nir-band [--nodata] [--threshold] [--raster-out]` | computes NDVI per-pixel straight from a raw BSQ/ENVI/GeoTIFF cube via `RS_MapAlgebra`, **independent of the engine**; the plugin auto-detects RED/NIR from wavelengths and extracts a 2-band cube first; pixels whose RED or NIR equals `--nodata` are excluded |
+| `q5_kmeans.py` (Q5, K-Means land cover) | `--rasters --output [--raster-out] [--k 8] [--features shape_brightness\|shape\|raw] [--sample 0.1] [--nodata] [--scale] [--roles] [--seed 42] [--verify]` | **unsupervised ML**: Spark MLlib K-Means on the pixels of a 6-band raw-cube subset, then the model is compiled to one Jiffle script (`utils/ml_jiffle.py`) and applied to every pixel with `RS_MapAlgebra` → byte class map per tile (nodata 255) + `clusters.csv` (suggested label from each cluster's mean NDVI/NDWI/NDSI) + `run_info.csv` |
+
+**Q5 in more detail.** Pixels become rows with `RS_BandAsArray` + `arrays_zip` +
+`posexplode`, per tile (a whole EnMAP scene as one raster row exhausts the default
+1 GB driver heap; 256-px tiles do not). The feature transform exists twice —
+Spark columns for training, Jiffle for mapping — both generated by
+`ml_jiffle.py` from the same constants. Default features are the L2-normalised
+spectrum (spectral *shape*, SAM-like, illumination-insensitive) plus one
+log-brightness feature, which is what separates dark water from bright snow.
+Validated on the EnMAP test scene (k = 8, seed 42; `tests/validate_raw_cube_jobs.py`):
+Jiffle map = MLlib predictions on 100 % of 1,069,499 valid pixels; background =
+EnMAP QL background exactly; the cluster labelled *Water* scores IoU 0.58
+(precision 0.82) and *Snow/ice* precision 0.92 against the scene's DLR QL masks;
+~12–15 s wall time. Raw-reflectance Euclidean K-Means scored snow IoU 0.41 and
+found no water.
 
 **No GeoParquet / pyarrow in the Spark JVM** — it collides fatally with the system
 `libgdal` on macOS. Inputs are GeoTIFF, zones are WKT/GeoJSON, outputs are CSV
 directories (`mode("overwrite")`). AOIs are read with `json` + `shapely` (no
 GeoPandas/Fiona); a FeatureCollection is dissolved with `shapely.unary_union`.
 
-**Memory note.** `RS_FromGeoTiff` loads a whole tile (all `N+7` bands) into the JVM
-per row — heavier than a CSV scan, which is the cost of true per-pixel analysis.
-Keep the engine's per-tile GeoTIFFs on disk (don't delete them after mosaicking),
-otherwise the analytics plugin has nothing to read.
+**Memory note.** `RS_FromGeoTiff` decodes a whole tile per row. On the engine's
+full `N+7`-band tiles (~242 MB per 512-px EnMAP tile) Q1–Q3 all hit
+`OutOfMemoryError` — at the default 1 GB driver heap and still at 6 GB, because
+local Spark decodes one tile per core in parallel. The plugin therefore copies
+only the 7 index bands of each tile into a temp directory on its worker thread
+(`raster_prep.extract_index_tiles`, ~2 s for an EnMAP scene) and runs Q1–Q3 on
+those ~3.5 MB tiles at the default heap (each job ~7–9 s on the test scene).
+Keep the engine's per-tile GeoTIFFs on disk (don't delete them after
+mosaicking), otherwise the analytics plugin has nothing to read.
+
+**Q3 NaN guard.** A tile with no valid pixels has `mean_ndvi = NaN`, and Spark SQL
+orders NaN above every number, so `NaN >= threshold` was true and empty
+background tiles were reported as vegetated (EnMAP scene: 7 reported, 4 real).
+Q3 now filters `NOT isnan(mean_ndvi)`.
 
 ---
 
@@ -392,8 +438,10 @@ copy the plugin runs) — keep them in sync (verify after any job edit).
 | # | Limitation | Mitigation |
 |---|------------|------------|
 | L1 | **Per-tile normalisation seams** — each raw-band tile is stretched by its own min/max, so identical reflectance can map to different display values across tiles. Index bands are unaffected (computed before normalisation). | Disable normalisation for scientific output (physical reflectance is already mosaic-consistent), or add a global two-pass min/max. |
-| L2 | **`BadBandRemover` runs before `SpectralFeatures`** — a band >50 % nodata is masked wholesale, so its valid pixels don't contribute to indices. | Defensible "bad band" definition; swap the stage order to keep those pixels. |
-| L3 | **Sedona `ST_Transform(geom,'epsg:4326')` axis order** — GeoTools treats EPSG:4326 as lat/lon; on some builds a known-overlapping join can return empty if coordinates are swapped. | Verify on real UTM data; wrap with `ST_FlipCoordinates` or use the 3-arg `ST_Transform` if needed. |
+| L2 | **`BadBandRemover` runs before `SpectralFeatures`** — a band >50 % nodata is masked wholesale, so its valid pixels don't contribute to indices. The scene's own background counts as nodata, so **edge tiles that are >50 % background lose every index**: on the EnMAP test scene 3 of 9 tiles (60 %, 77 %, 97 % background) → **71,649 valid pixels (6.7 %) get no indices**, and Q3 sees those tiles as empty. | Measure the nodata fraction over the tile's valid footprint (pixels that are not all-band nodata) instead of the whole tile, or swap the stage order. |
+| L3 | **Sedona `ST_Transform(geom,'epsg:4326')` axis order** — GeoTools treats EPSG:4326 as lat/lon; on some builds a known-overlapping join can return empty if coordinates are swapped. | **Verified OK on real UTM 32N data** with Sedona 1.5.1 + geotools-wrapper 1.5.1-28.2 (Q1 and Q2 return the expected tiles/zones on the EnMAP test scene); re-check if those versions change. |
+| L4 | **`RS_ZonalStats` over `RS_Envelope(rast)` skips the raster's outermost pixel ring** (Q3/Q4 per-tile stats). On the EnMAP test scene this is 13 of 1,069,499 valid pixels; the mean is unaffected at 4 decimals. | Accept, or compute whole-raster stats with `RS_SummaryStats` instead of an envelope zone. |
+| L5 | **Q5 clusters are not classes.** K-Means cannot isolate rare classes at small *k*, splits one material by illumination when brightness dominates, and does not separate clouds from snow (IoU ≤ 0.28 vs the QL cloud mask). Cluster numbers change with the seed; labels are threshold heuristics. | Use *k* ≈ 8 with shape+brightness features (validated default); treat `suggested_label` as a suggestion; use SAM for targeted detection. |
 
 ---
 
@@ -409,3 +457,8 @@ copy the plugin runs) — keep them in sync (verify after any job edit).
 | `main.cpp` | Per-iteration `try/catch` so no exception escapes the OpenMP region (UB); report the first error and exit code **2** on any tile failure. |
 | Advanced operations | Added `--operation pca` (false-colour PC composite) and `--operation sam` (Spectral Angle Mapper) alongside the 7 spectral indices. |
 | Plugin split | Replaced the single monolithic plugin with two independent plugins (`hyperspatial_processing`, `hyperspatial_analytics`); the processing plugin ships binary-free and the STAC downloader and `summary.csv` bridge were removed in favour of GeoTIFFs read directly by Sedona. |
+| `raster_prep` + `q_raw_ndvi.py` | **Fixed Q4 NDVI bias:** raw-cube tiles no longer carry the cube's scale/offset or nodata flag (GeoTools applied the 0.0001 gain, turning the −32768 background into −3.2768 and counting it as NDVI 0); the source nodata is passed as `--nodata`. Test scene: 0.393 → 0.562 (= NumPy). |
+| `q5_kmeans.py`, `utils/ml_jiffle.py` | Added **Q5 K-Means land cover** (Spark MLlib → Jiffle class map), with unit tests (`tests/test_ml_jiffle.py`), an end-to-end validation (`tests/validate_raw_cube_jobs.py`) and a headless QGIS dialog smoke test (`tests/qgis_dialog_smoke.py`). |
+| `spark_locator.spark_env` | Drops `PYTHONHOME`/`PYTHONPATH` from the spark-submit child env so QGIS's embedded-Python settings cannot break the Spark env's interpreter. |
+| Q1–Q3 (`dialog.py`, `raster_prep.extract_index_tiles`) | **Fixed Q1–Q3 `OutOfMemoryError` on real engine output:** the worker thread passes 7-band index copies of the engine tiles instead of the full 231-band tiles. |
+| `q3_ndvi_filter.py` | **Fixed** NaN (empty) tiles passing the NDVI threshold. |

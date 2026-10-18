@@ -31,7 +31,9 @@ zip -r "$ZIP_NAME" "$PLUGIN_DIR" \
     -x "*/__pycache__/*" \
     -x "*/.DS_Store" \
     -x "*/bin/*" \
-    -x "*/test/*"
+    -x "*/test/*" \
+    -x "*.pyc" \
+    -x "*/.pytest_cache/*"
 
 echo "Done! The plugin is ready for upload: $ZIP_NAME"
 echo "File size:"

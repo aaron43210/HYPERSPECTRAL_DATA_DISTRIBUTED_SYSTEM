@@ -4,12 +4,14 @@ name=HyperSpatial Sedona Analytics
 qgisMinimumVersion=3.0
 qgisMaximumVersion=4.99
 description=Distributed per-pixel spatial SQL over hyperspectral index rasters using PySpark and Apache Sedona.
-version=0.1
+version=0.2
 author=Aaron R
 email=aaronr43210@gmail.com
-about=HyperSpatial Sedona Analytics is a local-first QGIS plugin from Digital University Kerala for distributed, per-pixel spatial analytics over the spectral-index GeoTIFFs produced by the HyperSpatial processing engine. It runs bundled PySpark + Apache Sedona raster jobs (AOI filter, per-field spatial join, NDVI filter) directly on the per-tile GeoTIFFs via RS_FromGeoTiff, with zonal statistics reprojected into each raster's CRS. Spark runs as a background subprocess so the QGIS UI is never blocked; outputs are written as CSV directories. Data transfer stays GeoTIFF + CSV + WKT (no GeoParquet/pyarrow, which collides with the system GDAL). Requires a working Spark/Sedona environment (see the bundled spark-sedona/requirements.txt).
+about=HyperSpatial Sedona Analytics is a local-first QGIS plugin from Digital University Kerala for distributed, per-pixel spatial analytics over the spectral-index GeoTIFFs produced by the HyperSpatial processing engine. It runs bundled PySpark + Apache Sedona raster jobs (AOI filter, per-field spatial join, NDVI filter, raw-cube NDVI, and unsupervised K-Means land-cover clustering with Spark MLlib) directly on the per-tile GeoTIFFs via RS_FromGeoTiff, with zonal statistics reprojected into each raster's CRS. Spark runs as a background subprocess so the QGIS UI is never blocked; outputs are written as CSV directories. Data transfer stays GeoTIFF + CSV + WKT (no GeoParquet/pyarrow, which collides with the system GDAL). Requires a working Spark/Sedona environment (see the bundled spark-sedona/requirements.txt).
 category=Raster
 experimental=True
 tracker=https://github.com/aaron43210/HYPERSPECTRAL_DATA_DISTRIBUTED_SYSTEM/issues
 repository=https://github.com/aaron43210/HYPERSPECTRAL_DATA_DISTRIBUTED_SYSTEM
 homepage=https://github.com/aaron43210/HYPERSPECTRAL_DATA_DISTRIBUTED_SYSTEM
+changelog=0.2 Added Q5: unsupervised K-Means land-cover map from a raw cube (Spark MLlib, applied per pixel via Sedona map algebra) with a labelled legend. Fixed raw-cube NDVI counting the cube's nodata background as NDVI 0 (cubes with a scale factor, e.g. EnMAP). Spark child no longer inherits QGIS's PYTHONHOME/PYTHONPATH. AOI filter, spatial join and NDVI filter now run on full EnMAP engine output (only the 7 index bands are passed to Spark; previously out-of-memory). NDVI filter no longer reports empty tiles as vegetated.
+ 0.1 Initial release: AOI filter, spatial join, NDVI filter, raw-cube NDVI.

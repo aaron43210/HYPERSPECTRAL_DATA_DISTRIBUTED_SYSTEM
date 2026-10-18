@@ -23,6 +23,7 @@ import threading
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QRadioButton, QDoubleSpinBox, QSpinBox, QTextEdit, QFileDialog, QMessageBox, QCheckBox,
+    QComboBox,
 )
 from qgis.PyQt.QtCore import pyqtSignal, QSettings
 from qgis.core import QgsRasterLayer, QgsProject
@@ -40,6 +41,19 @@ SEDONA_PACKAGES = ("org.apache.sedona:sedona-spark-shaded-3.4_2.12:1.5.1,"
                    "org.datasyslab:geotools-wrapper:1.5.1-28.2")
 SEDONA_REPOSITORIES = "https://artifacts.unidata.ucar.edu/repository/unidata-all"
 
+# Q5 class-map legend colours, keyed by ml_jiffle.suggest_label().
+KMEANS_LABEL_COLOURS = {
+    "Snow/ice": (225, 240, 255),
+    "Water": (31, 120, 180),
+    "Dense vegetation": (26, 110, 40),
+    "Sparse vegetation/grass": (150, 200, 80),
+    "Bare rock/soil": (170, 125, 85),
+    "Shadow/dark surface": (60, 60, 60),
+}
+# Q5 prepares the cube as tiles of this size: a whole scene as one raster row
+# exhausts spark-submit's default 1 GB driver heap; 256-px tiles stay small.
+KMEANS_TILE_SIZE = 256
+
 
 class SedonaAnalyticsDialog(QDialog):
 
@@ -47,6 +61,7 @@ class SedonaAnalyticsDialog(QDialog):
     spark_log = pyqtSignal(str)
     spark_finished = pyqtSignal()
     rasters_ready = pyqtSignal(str)
+    kmeans_ready = pyqtSignal(str, str)     # (class-map VRT, clusters.csv)
 
     def __init__(self, iface, parent=None):
         super(SedonaAnalyticsDialog, self).__init__(parent)
@@ -59,6 +74,7 @@ class SedonaAnalyticsDialog(QDialog):
         self.spark_log.connect(self.append_spark_log)
         self.spark_finished.connect(self.on_spark_finished)
         self.rasters_ready.connect(self.on_rasters_ready)
+        self.kmeans_ready.connect(self.on_kmeans_ready)
 
     def append_spark_log(self, msg):
         self.txt_spark_log.append(msg)
@@ -89,6 +105,45 @@ class SedonaAnalyticsDialog(QDialog):
                 loaded += 1
         self.txt_spark_log.append(f"Loaded {loaded} result raster(s) onto the canvas.")
 
+    def on_kmeans_ready(self, vrt_path, clusters_csv):
+        """Add the Q5 class map (one VRT over the per-tile GeoTIFFs) with a legend.
+
+        GUI-thread slot: the worker thread already built the VRT; only the QGIS
+        layer and renderer are created here.
+        """
+        import csv
+        from qgis.core import QgsPalettedRasterRenderer
+        from qgis.PyQt.QtGui import QColor
+        layer = QgsRasterLayer(vrt_path, "K-Means land cover (Q5)")
+        if not layer.isValid():
+            self.txt_spark_log.append(f"Could not open the class map {vrt_path}")
+            return
+        try:
+            with open(clusters_csv, newline="") as f:
+                rows = list(csv.DictReader(f))
+        except OSError as e:
+            rows = []
+            self.txt_spark_log.append(f"clusters.csv unreadable ({e}); using plain colours.")
+        classes, seen = [], {}
+        for r in rows:
+            label = r["suggested_label"]
+            colour = QColor(*KMEANS_LABEL_COLOURS.get(label, (200, 200, 200)))
+            # Several clusters can share a label: shade repeats so they stay distinct.
+            repeat = seen.get(label, 0)
+            seen[label] = repeat + 1
+            if repeat:
+                colour = colour.darker(100 + 25 * repeat)
+            classes.append(QgsPalettedRasterRenderer.Class(
+                int(r["cluster"]), colour,
+                f"{label} (c{r['cluster']}, {float(r['pct']):.1f}%)"))
+        if classes:
+            layer.setRenderer(QgsPalettedRasterRenderer(layer.dataProvider(), 1, classes))
+        QgsProject.instance().addMapLayer(layer)
+        self.txt_spark_log.append(
+            f"Loaded the K-Means class map ({len(classes)} clusters) onto the canvas.\n"
+            f"Cluster table: {clusters_csv}\n"
+            "Labels are suggestions from each cluster's mean NDVI / NDWI / NDSI.")
+
     def _browse_raw_cube(self):
         path = QFileDialog.getOpenFileName(
             self, "Select raw hyperspectral cube",
@@ -103,7 +158,9 @@ class SedonaAnalyticsDialog(QDialog):
                     path = cand
                     break
         self.le_raw.setText(path)
-        self.radio_q4.setChecked(True)
+        # Both raw-cube jobs (Q4 NDVI, Q5 K-Means) use this file; keep Q5 if chosen.
+        if not self.radio_q5.isChecked():
+            self.radio_q4.setChecked(True)
         try:
             from .raster_prep import detect_red_nir
             red, nir, nb = detect_red_nir(path)
@@ -135,11 +192,13 @@ class SedonaAnalyticsDialog(QDialog):
         self.radio_q2.setChecked(True)
         self.radio_q3 = QRadioButton("NDVI Filter: per-pixel vegetation fraction / mean NDVI per tile.")
         self.radio_q4 = QRadioButton("Raw cube NDVI: compute NDVI per-pixel straight from a BSQ/ENVI/GeoTIFF cube (no engine).")
+        self.radio_q5 = QRadioButton("ML - K-Means land cover: unsupervised Spark MLlib clustering of a raw cube (no labels, no engine).")
 
         layout.addWidget(self.radio_q1)
         layout.addWidget(self.radio_q2)
         layout.addWidget(self.radio_q3)
         layout.addWidget(self.radio_q4)
+        layout.addWidget(self.radio_q5)
 
         # Input: the engine's output DIRECTORY of tile_r*.tif rasters. Sedona
         # reads the real GeoTIFFs (RS_FromGeoTiff) and computes on actual pixels,
@@ -191,7 +250,7 @@ class SedonaAnalyticsDialog(QDialog):
         # onto the canvas.
         h4 = QHBoxLayout()
         self.le_raw = QLineEdit()
-        self.le_raw.setPlaceholderText("Raw cube file (BSQ/ENVI/GeoTIFF) - for Raw cube NDVI")
+        self.le_raw.setPlaceholderText("Raw cube file (BSQ/ENVI/GeoTIFF) - for Raw cube NDVI and K-Means")
         btn_raw = QPushButton("Browse")
         btn_raw.clicked.connect(self._browse_raw_cube)
         h4.addWidget(QLabel("Raw cube:"))
@@ -211,6 +270,30 @@ class SedonaAnalyticsDialog(QDialog):
         h5.addWidget(self.spin_nir)
         h5.addStretch()
         layout.addLayout(h5)
+
+        # K-Means (Q5) on the same raw cube. Bands (blue..swir2) are picked by
+        # wavelength automatically. Defaults are the validated ones: k=8 with
+        # shape+brightness features separated water and snow on an EnMAP scene.
+        h6 = QHBoxLayout()
+        h6.addWidget(QLabel("K-Means (Q5) clusters:"))
+        self.spin_k = QSpinBox()
+        self.spin_k.setRange(2, 12)
+        self.spin_k.setValue(8)
+        h6.addWidget(self.spin_k)
+        h6.addWidget(QLabel("features:"))
+        self.cb_kmeans_features = QComboBox()
+        self.cb_kmeans_features.addItem("Shape + brightness (recommended)", "shape_brightness")
+        self.cb_kmeans_features.addItem("Spectral shape only (SAM-like)", "shape")
+        self.cb_kmeans_features.addItem("Raw reflectance", "raw")
+        h6.addWidget(self.cb_kmeans_features)
+        h6.addWidget(QLabel("training sample:"))
+        self.spin_sample = QDoubleSpinBox()
+        self.spin_sample.setRange(0.01, 1.0)
+        self.spin_sample.setSingleStep(0.05)
+        self.spin_sample.setValue(0.10)
+        h6.addWidget(self.spin_sample)
+        h6.addStretch()
+        layout.addLayout(h6)
 
         # Spark locator row (mirrors the processing plugin's engine Browse):
         # resolve spark-submit explicitly so a Finder-launched QGIS - which does
@@ -283,7 +366,7 @@ class SedonaAnalyticsDialog(QDialog):
         tiles_dir = os.path.join(work, "tiles")
         try:
             from .raster_prep import prepare_red_nir_tile
-            prepare_red_nir_tile(src, tiles_dir, self.spin_red.value(), self.spin_nir.value())
+            prep = prepare_red_nir_tile(src, tiles_dir, self.spin_red.value(), self.spin_nir.value())
         except Exception as e:
             self.txt_spark_log.append(f"ERROR preparing RED/NIR GeoTIFF: {e}")
             self.btn_spark.setEnabled(True)
@@ -297,6 +380,11 @@ class SedonaAnalyticsDialog(QDialog):
                       "--red-band", "1", "--nir-band", "2",
                       "--threshold", str(self.spin_ndvi.value()),
                       "--raster-out", raster_out]
+        # The tile keeps the cube's raw values with its nodata flag cleared, so
+        # the job must be told the sentinel (EnMAP: -32768) or background pixels
+        # are averaged in as NDVI 0.
+        if prep["nodata"] is not None:
+            spark_args += ["--nodata", str(prep["nodata"])]
 
         spark_submit, _source, err = resolve_spark_submit()
         if not spark_submit:
@@ -313,10 +401,102 @@ class SedonaAnalyticsDialog(QDialog):
         threading.Thread(target=self._spark_task,
                          args=(cmd, out_dir, spark_submit, raster_out), daemon=True).start()
 
+    def _run_kmeans(self):
+        """Q5: unsupervised K-Means land-cover map from a raw cube (Spark MLlib).
+
+        Only inputs are validated here. The GDAL tiling (seconds on a 686 MB
+        EnMAP cube), spark-submit and the VRT mosaic all run in _kmeans_task on
+        a worker thread so the QGIS UI never blocks.
+        """
+        import tempfile
+        src = self.le_raw.text().strip()
+        if not src or not os.path.isfile(src):
+            QMessageBox.warning(self, "Warning",
+                "Pick a raw cube file (BSQ/ENVI/GeoTIFF) with the Raw cube Browse button.")
+            return
+        script_path = os.path.join(os.path.dirname(__file__), 'spark-sedona', 'jobs',
+                                   "q5_kmeans.py")
+        if not os.path.exists(script_path):
+            QMessageBox.warning(self, "Warning", "q5_kmeans.py not found in the bundled jobs.")
+            return
+        spark_submit, _source, err = resolve_spark_submit()
+        self._refresh_spark_label()
+        if not spark_submit:
+            QMessageBox.warning(self, "spark-submit not found", err)
+            return
+
+        self.txt_spark_log.clear()
+        self.btn_spark.setEnabled(False)
+        opts = {"k": self.spin_k.value(),
+                "features": self.cb_kmeans_features.currentData(),
+                "sample": self.spin_sample.value()}
+        work = tempfile.mkdtemp(prefix="hs_kmeans_")
+        self.txt_spark_log.append(
+            f"K-Means: k={opts['k']}, features={opts['features']}, "
+            f"sample={opts['sample']:.0%} -> {os.path.basename(src)}\nWork dir: {work}")
+        threading.Thread(target=self._kmeans_task,
+                         args=(src, work, opts, spark_submit, script_path), daemon=True).start()
+
+    def _kmeans_task(self, src, work, opts, spark_submit, script_path):
+        """Worker thread for Q5: prepare tiles -> spark-submit -> VRT -> signal."""
+        import glob as _glob
+        try:
+            from osgeo import gdal
+            from .raster_prep import detect_bands, prepare_band_tiles
+            bands = detect_bands(src)
+            if len(bands) < 2:
+                self.spark_log.emit(
+                    "ERROR: could not pick bands by wavelength (the cube advertises no "
+                    "wavelengths, or covers too few of blue/green/red/NIR/SWIR).")
+                return
+            self.spark_log.emit("Bands: " + ", ".join(f"{r}={b}" for r, b in bands.items())
+                                + f" - tiling at {KMEANS_TILE_SIZE} px ...")
+            tiles_dir = os.path.join(work, "tiles")
+            prep = prepare_band_tiles(src, tiles_dir, list(bands.values()),
+                                      tile_size=KMEANS_TILE_SIZE)
+            self.spark_log.emit(f"Prepared {len(prep['tiles'])} tiles "
+                                f"(nodata={prep['nodata']}, scale={prep['scale']:g}).")
+            if prep["offset"]:
+                self.spark_log.emit(f"WARNING: the cube has a non-zero offset "
+                                    f"({prep['offset']:g}); labels assume offset 0.")
+
+            out_dir = os.path.join(work, "sedona_results")
+            raster_out = os.path.join(work, "class_tiles")
+            cmd = [spark_submit, "--packages", SEDONA_PACKAGES,
+                   "--repositories", SEDONA_REPOSITORIES, script_path,
+                   "--rasters", tiles_dir, "--output", out_dir, "--raster-out", raster_out,
+                   "--k", str(opts["k"]), "--features", opts["features"],
+                   "--sample", str(opts["sample"]), "--roles", ",".join(bands),
+                   "--scale", str(prep["scale"])]
+            if prep["nodata"] is not None:
+                cmd += ["--nodata", str(prep["nodata"])]
+            rc = self._stream_process(cmd, spark_submit)
+            if rc != 0:
+                self.spark_log.emit(f"\n--- SPARK JOB FAILED (exit code {rc}) ---")
+                return
+            tifs = sorted(_glob.glob(os.path.join(raster_out, "**", "*.tif"), recursive=True))
+            if not tifs:
+                self.spark_log.emit(f"No class-map tiles found in {raster_out}")
+                return
+            # One layer for the whole scene: mosaic the per-tile class maps.
+            vrt_path = os.path.join(work, "kmeans_classes.vrt")
+            vrt = gdal.BuildVRT(vrt_path, tifs,
+                                options=gdal.BuildVRTOptions(srcNodata=255, VRTNodata=255))
+            vrt = None    # flush the VRT to disk before QGIS opens it
+            self.spark_log.emit(f"\n--- SPARK JOB COMPLETE ---\nResults written to: {out_dir}")
+            self.kmeans_ready.emit(vrt_path, os.path.join(out_dir, "clusters.csv"))
+        except Exception as e:
+            self.spark_log.emit(f"K-Means failed: {e}")
+        finally:
+            self.spark_finished.emit()
+
     def run_analytics(self):
         import glob as _glob
         if self.radio_q4.isChecked():
             self._run_raw_cube()
+            return
+        if self.radio_q5.isChecked():
+            self._run_kmeans()
             return
         rasters_dir = self.le_rasters.text().strip()
         if not rasters_dir:
@@ -334,6 +514,15 @@ class SedonaAnalyticsDialog(QDialog):
 
         self.txt_spark_log.clear()
         self.btn_spark.setEnabled(False)
+
+        # Q1-Q3 read only the 7 trailing index bands. Decoding the engine's full
+        # 231-band tiles exhausts the Spark heap (OOM even at 6 GB on an EnMAP
+        # scene), so the worker thread first copies just the index bands into a
+        # temp dir and the job reads that (band order kept -> offsets unchanged).
+        # A temp dir also keeps job outputs that live under rasters_dir (e.g. the
+        # Q3 tile_r*_vegmask.tif) out of the recursive tile_r*.tif glob.
+        import tempfile
+        index_dir = tempfile.mkdtemp(prefix="hs_index_tiles_")
 
         # The plugin is self-contained: the Sedona raster jobs are bundled.
         jobs_dir = os.path.join(os.path.dirname(__file__), 'spark-sedona', 'jobs')
@@ -367,7 +556,7 @@ class SedonaAnalyticsDialog(QDialog):
         raster_out = None
         if script_name == "q3_ndvi_filter.py":
             spark_args = ["spark-submit", script_path,
-                          "--rasters", rasters_dir,
+                          "--rasters", index_dir,
                           "--output", out_dir,
                           "--threshold", str(self.spin_ndvi.value())]
             if self.chk_load_raster.isChecked():
@@ -390,10 +579,10 @@ class SedonaAnalyticsDialog(QDialog):
                 return
             if script_name == "q1_aoi_filter.py":
                 spark_args = ["spark-submit", script_path,
-                              "--rasters", rasters_dir, "--output", out_dir, "--aoi", aoi_path]
+                              "--rasters", index_dir, "--output", out_dir, "--aoi", aoi_path]
             else:  # q2_spatial_join.py
                 spark_args = ["spark-submit", script_path,
-                              "--rasters", rasters_dir, "--agri", aoi_path, "--output", out_dir]
+                              "--rasters", index_dir, "--agri", aoi_path, "--output", out_dir]
 
         # Resolve spark-submit via the shared locator (QSettings -> SPARK_HOME ->
         # PATH -> common dirs -> login shell), mirroring the engine Browse flow.
@@ -408,23 +597,36 @@ class SedonaAnalyticsDialog(QDialog):
         cmd = ([spark_submit, "--packages", SEDONA_PACKAGES,
                 "--repositories", SEDONA_REPOSITORIES] + spark_args[1:])
 
+        def prep():
+            from .raster_prep import extract_index_tiles
+            self.spark_log.emit("Extracting the 7 spectral-index bands from the engine tiles ...")
+            n = len(extract_index_tiles(rasters_dir, index_dir))
+            self.spark_log.emit(f"Prepared {n} index tile(s) in {index_dir}")
+
         threading.Thread(target=self._spark_task,
-                         args=(cmd, out_dir, spark_submit, raster_out), daemon=True).start()
+                         args=(cmd, out_dir, spark_submit, raster_out, prep), daemon=True).start()
 
-    def _spark_task(self, cmd, out_dir, spark_submit=None, raster_out=None):
+    def _stream_process(self, cmd, spark_submit=None):
+        """Run spark-submit, streaming its output to the log; return the exit code.
+
+        Worker-thread only. spark_env() unsets HADOOP_CONF_DIR (a populated value
+        crashes the JVM on macOS), sets JAVA_HOME, and prepends the spark-submit /
+        conda bin dirs to PATH so the child finds python/pyspark/java even when
+        QGIS was launched from Finder without a shell environment.
+        """
+        self.spark_log.emit(f"Executing: {' '.join(cmd)}\n")
+        env = spark_env(spark_submit)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        for line in iter(proc.stdout.readline, ''):
+            self.spark_log.emit(line.strip())
+        proc.stdout.close()
+        return proc.wait()
+
+    def _spark_task(self, cmd, out_dir, spark_submit=None, raster_out=None, prep=None):
         try:
-            self.spark_log.emit(f"Executing: {' '.join(cmd)}\n")
-            # spark_env() unsets HADOOP_CONF_DIR (a populated value crashes the
-            # JVM on macOS), sets JAVA_HOME, and prepends the spark-submit / conda
-            # bin dirs to PATH so the child finds python/pyspark/java even when
-            # QGIS was launched from Finder without a shell environment.
-            env = spark_env(spark_submit)
-
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-            for line in iter(proc.stdout.readline, ''):
-                self.spark_log.emit(line.strip())
-            proc.stdout.close()
-            rc = proc.wait()
+            if prep is not None:
+                prep()      # worker-thread GDAL step (Q1-Q3 index-band extraction)
+            rc = self._stream_process(cmd, spark_submit)
             if rc == 0:
                 self.spark_log.emit(f"\n--- SPARK JOB COMPLETE ---\nResults written to: {out_dir}")
                 # Load result rasters on the GUI thread (never from here).

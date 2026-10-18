@@ -168,6 +168,12 @@ def spark_env(spark_submit_path=None):
     try:
         env = os.environ.copy()
         env['HADOOP_CONF_DIR'] = ''
+        # QGIS's embedded Python may export its own PYTHONHOME/PYTHONPATH. The
+        # Spark env's interpreter (a different Python version) would inherit
+        # them, load QGIS's stdlib and die before Spark starts
+        # ("SRE module mismatch" / "No module named 'encodings'").
+        for var in ('PYTHONHOME', 'PYTHONPATH'):
+            env.pop(var, None)
 
         path_prepends = []
         if spark_submit_path and os.path.isfile(spark_submit_path):
@@ -198,4 +204,6 @@ def spark_env(spark_submit_path=None):
     except Exception:
         env = os.environ.copy()
         env['HADOOP_CONF_DIR'] = ''
+        for var in ('PYTHONHOME', 'PYTHONPATH'):
+            env.pop(var, None)
         return env
