@@ -50,7 +50,7 @@ check("metadata: required fields present", not missing, ", ".join(missing) or "a
 check("metadata: stable (experimental=False, deprecated=False)",
       g.get("experimental") == "False" and g.get("deprecated") == "False",
       f"experimental={g.get('experimental')} deprecated={g.get('deprecated')}")
-check("metadata: version 1.0.0 with changelog entry", g.get("version") == "1.0.0" and "1.0.0" in g.get("changelog", ""),
+check("metadata: version has a changelog entry", g.get("version") and g.get("version") in g.get("changelog", ""),
       g.get("version"))
 icon = os.path.join(plugins, "hyperspatial_processing", g.get("icon", ""))
 check("metadata: icon exists and is small", os.path.isfile(icon) and os.path.getsize(icon) < 100_000,

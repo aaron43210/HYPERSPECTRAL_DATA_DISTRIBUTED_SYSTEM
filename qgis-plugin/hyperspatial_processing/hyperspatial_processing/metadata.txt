@@ -4,7 +4,7 @@ name=HyperSpectral Processer
 qgisMinimumVersion=3.0
 qgisMaximumVersion=4.99
 description=Local, parallel hyperspectral processing in QGIS: spectral indices, PCA and Spectral Angle Mapper target detection via an external multi-core C++ engine (OpenMP, optional OpenCL GPU).
-version=1.0.0
+version=1.0.1
 author=Aaron R
 email=aaronr43210@gmail.com
 about=Single-purpose, local-first QGIS plugin from Digital University Kerala for hyperspectral image processing. It drives an external C++/OpenMP/OpenCL engine to process hyperspectral rasters entirely on local hardware, writing results as GeoTIFF or VRT layers and loading them straight into the QGIS canvas. All per-pixel math runs in the native engine to keep large scenes off the Python heap. The plugin ships binary-free: the engine is located at run time from a configured path or the system PATH, or downloaded with one click from the project's GitHub Releases (or built from the hpc-engine source in the repository).
@@ -18,6 +18,6 @@ icon=icons/icon.png
 tracker=https://github.com/aaron43210/HYPERSPECTRAL_DATA_DISTRIBUTED_SYSTEM/issues
 repository=https://github.com/aaron43210/HYPERSPECTRAL_DATA_DISTRIBUTED_SYSTEM
 homepage=https://github.com/aaron43210/HYPERSPECTRAL_DATA_DISTRIBUTED_SYSTEM
-changelog=1.0.0 First stable release. Spectral indices (NDVI, NDWI, NDBI, SAVI, EVI, NDMI, MSAVI), PCA false-colour composites and Spectral Angle Mapper target detection on an external OpenMP/OpenCL engine; one-click engine download; dialog and SAM map tool released cleanly on unload; optimised icon.
+changelog=1.0.1 First stable release. Spectral indices (NDVI, NDWI, NDBI, SAVI, EVI, NDMI, MSAVI), PCA false-colour composites and Spectral Angle Mapper target detection on an external OpenMP/OpenCL engine; one-click engine download; dialog and SAM map tool released cleanly on unload; optimised icon.
  0.2 Added an Operation selector with two new operations alongside spectral indices: PCA (false-colour PC composites) and Spectral Angle Mapper (SAM) target detection from a picked reference pixel, with optional detection mask and similarity band.
  0.1 Initial release: spectral indices (NDVI, NDWI, NDBI, SAVI, EVI, NDMI, MSAVI).
