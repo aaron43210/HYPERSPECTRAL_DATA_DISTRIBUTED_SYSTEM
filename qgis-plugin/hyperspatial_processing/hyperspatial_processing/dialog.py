@@ -13,10 +13,6 @@
 #   * PyQt5 is imported via qgis.PyQt.
 #   * Per-pixel math stays in the native engine (no rasterio / geopandas here).
 
-# Number of spectral index bands the C++ engine appends to every tile GeoTIFF,
-# in fixed order: NDVI, NDWI, NDBI, SAVI, EVI, NDMI, MSAVI.
-_N_INDEX_BANDS = 7
-
 import os
 import sys
 import ssl
@@ -43,6 +39,10 @@ from osgeo import gdal
 from .engine_locator import (
     resolve_engine, engine_env, ENGINE_SETTINGS_KEY, _platform_exe,
 )
+
+# Number of spectral index bands the C++ engine appends to every tile GeoTIFF,
+# in fixed order: NDVI, NDWI, NDBI, SAVI, EVI, NDMI, MSAVI.
+_N_INDEX_BANDS = 7
 
 # Prebuilt engine releases live on GitHub Releases; "Download engine" fetches the
 # asset matching the host platform so a store-installed (binary-free) plugin can
@@ -184,13 +184,16 @@ class HyperspectralProcessingDialog(QDialog):
         page_indices = QWidget()
         pi = QVBoxLayout(page_indices)
         opt = QHBoxLayout()
-        self.chk_ndvi = QCheckBox("NDVI"); self.chk_ndvi.setChecked(True)
-        self.chk_ndwi = QCheckBox("NDWI"); self.chk_ndwi.setChecked(True)
-        self.chk_ndbi = QCheckBox("NDBI"); self.chk_ndbi.setChecked(True)
-        self.chk_savi = QCheckBox("SAVI"); self.chk_savi.setChecked(True)
-        self.chk_evi = QCheckBox("EVI"); self.chk_evi.setChecked(True)
-        self.chk_ndmi = QCheckBox("NDMI"); self.chk_ndmi.setChecked(True)
-        self.chk_msavi = QCheckBox("MSAVI"); self.chk_msavi.setChecked(True)
+        self.chk_ndvi = QCheckBox("NDVI")
+        self.chk_ndwi = QCheckBox("NDWI")
+        self.chk_ndbi = QCheckBox("NDBI")
+        self.chk_savi = QCheckBox("SAVI")
+        self.chk_evi = QCheckBox("EVI")
+        self.chk_ndmi = QCheckBox("NDMI")
+        self.chk_msavi = QCheckBox("MSAVI")
+        for chk in (self.chk_ndvi, self.chk_ndwi, self.chk_ndbi, self.chk_savi,
+                    self.chk_evi, self.chk_ndmi, self.chk_msavi):
+            chk.setChecked(True)
         for w in (self.chk_ndvi, self.chk_ndwi, self.chk_ndbi, self.chk_savi,
                   self.chk_evi, self.chk_ndmi, self.chk_msavi):
             opt.addWidget(w)
@@ -469,8 +472,8 @@ class HyperspectralProcessingDialog(QDialog):
         finally:
             self.btn_engine_download.setEnabled(True)
 
-
     # --------------------------------------------------------------- SAM pick
+
     def _update_sam_angle_label(self, value):
         """Live degree equivalent for the Max-angle (radians) spin box."""
         try:
@@ -553,7 +556,9 @@ class HyperspectralProcessingDialog(QDialog):
             with contextlib.suppress(Exception):
                 if self._sam_pick_tool is not None:
                     self.iface.mapCanvas().unsetMapTool(self._sam_pick_tool)
+
     # ------------------------------------------------------------------ run
+
     def run_hpc(self):
         layer = self.cb_input.currentLayer()
         if not layer:
@@ -779,20 +784,16 @@ class HyperspectralProcessingDialog(QDialog):
         is_vrt = self.radio_out_vrt.isChecked()
         ext = ".vrt" if is_vrt else ".tif"
 
-        if self.chk_ndvi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"ndvi_layer{ext}"), "Computed NDVI"))
-        if self.chk_ndwi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"ndwi_layer{ext}"), "Computed NDWI"))
-        if self.chk_ndbi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"ndbi_layer{ext}"), "Computed NDBI"))
-        if self.chk_savi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"savi_layer{ext}"), "Computed SAVI"))
-        if self.chk_evi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"evi_layer{ext}"), "Computed EVI"))
-        if self.chk_ndmi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"ndmi_layer{ext}"), "Computed NDMI"))
-        if self.chk_msavi.isChecked(): layers_to_load.append((os.path.join(out_dir, f"msavi_layer{ext}"), "Computed MSAVI"))
+        for key in ("ndvi", "ndwi", "ndbi", "savi", "evi", "ndmi", "msavi"):
+            if getattr(self, f"chk_{key}").isChecked():
+                layers_to_load.append((os.path.join(out_dir, f"{key}_layer{ext}"), f"Computed {key.upper()}"))
 
         # Layers already opened on the worker thread (fast path); otherwise open here.
         prepared = getattr(self, "_prepared_layers", None)
         self._prepared_layers = None
         if prepared is not None:
             from qgis.core import QgsProject
-            items = [(None, l.name(), l) for l in prepared]
+            items = [(None, lyr.name(), lyr) for lyr in prepared]
         else:
             items = [(p, n, None) for p, n in layers_to_load if os.path.exists(p)]
 
