@@ -82,8 +82,10 @@ class HyperspectralProcessingPlugin:
                     self.iface.mapCanvas().unsetMapTool(tool)
                 self.dialog.close()
                 self.dialog.deleteLater()
-            except Exception:
-                pass
+            except Exception as e:  # never let unload fail, but leave a trace
+                from qgis.core import QgsMessageLog, Qgis
+                QgsMessageLog.logMessage(f"Dialog cleanup on unload failed: {e}",
+                                         "HyperSpectral Processer", Qgis.MessageLevel.Warning)
             self.dialog = None
         self.first_start = True
 
